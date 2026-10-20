@@ -1,0 +1,127 @@
+{
+  "trades": [
+    {
+      "id": "TR-1792522987443-IX",
+      "symbol": "BTC/USDT",
+      "side": "LONG",
+      "action": "BUY",
+      "entryPrice": 60000,
+      "amount": 50,
+      "initialAmount": 50,
+      "margin": 50,
+      "initialMargin": 50,
+      "leverage": 10,
+      "status": "OPEN",
+      "openTime": 1792522987447,
+      "mode": "AUTO",
+      "isReal": false,
+      "isPaper": true,
+      "dataOrigin": "PAPER",
+      "decisionSource": "COMMITTEE",
+      "marketRegime": "NEUTRAL",
+      "stopLoss": 59000,
+      "takeProfit": 62000,
+      "correlationId": "corr-main-virt-1792522987442",
+      "correlationContext": {
+        "correlationId": "corr-main-virt-1792522987442",
+        "proposedTradeId": "TR-1792522987443-IX",
+        "entryIntentId": "intent_1792522987443_n31f594",
+        "signalId": "sig_btc/usdt_1792522987447_z6ume",
+        "strategyId": "CANONICAL_QUANT_SCALP_V2",
+        "strategyVersion": "2.1.0",
+        "stateRevision": 0,
+        "emittedAt": 1792522987447
+      },
+      "entryIntentId": "intent_1792522987443_n31f594",
+      "intentId": "intent_1792522987443_n31f594",
+      "tradeIntentId": "intent_1792522987443_n31f594",
+      "strategyId": "CANONICAL_QUANT_SCALP_V2",
+      "strategyVersion": "2.1.0",
+      "matchedRuleIds": [
+        "RULE_SAR_M1_M15",
+        "RULE_VWAP_ALIGNMENT",
+        "PAT_FUTURES_LONG_(SPOT_ACCUMULATION_&_BREAKOUT_(ПРОБОЙ_КОНСОЛИДАЦИИ))"
+      ],
+      "matchedRules": [
+        "RULE_SAR_M1_M15",
+        "RULE_VWAP_ALIGNMENT",
+        "PAT_FUTURES_LONG_(SPOT_ACCUMULATION_&_BREAKOUT_(ПРОБОЙ_КОНСОЛИДАЦИИ))"
+      ],
+      "features": [],
+      "committeeDecisionId": "comm_1792522987447_bbmva",
+      "agentDecisionIds": [
+        "dec_hunter_1792522987447_ddhhc",
+        "dec_bear_1792522987447_6xp83",
+        "comm_1792522987447_bbmva"
+      ],
+      "stateRevision": 1,
+      "lineageStatus": "COMPLIANT",
+      "history": [
+        {
+          "time": 1792522987447,
+          "type": "OPEN",
+          "price": 60000,
+          "amount": 50
+        }
+      ],
+      "marketType": "FUTURES",
+      "resolvedMarketType": "FUTURES",
+      "requestedMode": "FUTURES",
+      "allowedDirections": "BOTH",
+      "scannerSide": "LONG",
+      "strategySide": "LONG",
+      "committeeSide": "LONG",
+      "executionSide": "LONG",
+      "gateDiagnostics": {
+        "dataCompleteness": true,
+        "spreadSafety": true,
+        "spreadGate": true,
+        "liquiditySafety": true,
+        "volumeGate": true,
+        "fundingSafety": true,
+        "fundingGate": true,
+        "sideInvariantMatch": true,
+        "directionAllowed": true,
+        "patternNotBlacklisted": true,
+        "confidenceGate": true
+      },
+      "sourcePath": "MAIN_VIRTUAL",
+      "createdAt": 1792522987448
+    }
+  ],
+  "knowledge": [],
+  "virtualBalance": 950,
+  "settings": {
+    "main": {
+      "virtualBalance": 950
+    }
+  },
+  "paperLedger": [
+    {
+      "tradeId": "TR-1792522987443-IX",
+      "entryIntentId": "intent_1792522987443_n31f594",
+      "correlationId": "corr-main-virt-1792522987442",
+      "type": "RESERVE_OPEN",
+      "margin": 50,
+      "pnl": 0,
+      "balanceBefore": 1000,
+      "balanceAfter": 950,
+      "stateRevision": 1,
+      "timestamp": 1792522987448
+    }
+  ],
+  "paperIntentLog": [
+    {
+      "entryIntentId": "intent_1792522987443_n31f594",
+      "tradeId": "TR-1792522987443-IX",
+      "correlationId": "corr-main-virt-1792522987442",
+      "balanceBefore": 1000,
+      "balanceAfter": 950,
+      "timestamp": 1792522987448,
+      "revision": 1
+    }
+  ],
+  "decisionBundles": [],
+  "stateRevision": 1,
+  "updatedAt": 1792522987449
+}

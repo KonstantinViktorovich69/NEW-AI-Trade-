@@ -1,0 +1,1598 @@
+import ccxt from 'ccxt';
+import { normalizeSymbol } from '../quant.ts';
+import { calculateKelly, calculateAdaptiveCloseRatios } from '../quant.ts';
+import { logStructured } from '../utils/logger.ts';
+import { executePaperTradeOpenTransaction, executePaperTradeCloseTransaction } from './paperTradeTransaction.ts';
+import { dbAtomicStore } from '../atomicDbSaver.ts';
+import { type AgentDecisionEnvelope, evaluateCommitteeConsensus } from './agentEngine.ts';
+import { createAutopilotTradeIntentFromScanner } from './autopilotIntentFactory.ts';
+import { type AutoEntryExecutionPort } from './autoEntryService.ts';
+import { calculateStructuralStopLoss, calculateStructuralTpLadder } from './structuralExitLevels.ts';
+import { calculateOteEntryZone } from './oteEntryCalculator.ts';
+import { addOtePendingCandidate } from './oteVirtualQueue.ts';
+import { isTraditionalEquitySymbol } from './marketSignalScanner.ts';
+import { isPatternBlacklisted } from './signalEngine.ts';
+import { SignalPerformanceAnalyticsService } from './signalPerformanceAnalyticsService.ts';
+import { evaluateKnowledgeBaseForSignal } from './quantRiskEngine.ts';
+import { incFunnel } from './funnelCounters.ts';
+import { isEntryPaused } from './entryGate.ts';
+import { getCellVerdict } from './learningCellService.ts';
+import { computeQuantFeaturesV2 } from './quantFeaturesV2.ts';
+import { calculateProbabilityV2IfAccepted } from './quantModelV2.ts';
+import { evaluateSessionFilter } from './sessionTradingService.ts';
+
+export interface AutoPilotEngineDependencies {
+  getGlobalSettings: () => any;
+  getCacheSignals: () => any;
+  getVirtualTrades: () => any[];
+  pushVirtualTrade: (trade: any) => void;
+  getVirtualBalance: () => number;
+  setVirtualBalance: (val: number) => void;
+  getStartOfDayBalance: () => number;
+  getGlobalCcxtTickers: () => Record<string, any>;
+  getGlobalTrueOhlcv: () => Record<string, any>;
+  getGlobalAdx: () => Record<string, number>;
+  getGlobalAtr: () => Record<string, number>;
+  getGlobalOrderBookHistory: () => Record<string, any[]>;
+  getOrderBookImbalance: () => Record<string, any>;
+  getGlobalMarketPulse: () => any;
+  getProlivPeaks: () => any[];
+  getAutopilotFailedSymbols: () => Set<string>;
+  getSymbolsUndergoingRealOpen: () => Set<string>;
+  isCircuitBreakerActive: () => boolean;
+  committeeVetoShadowStats: { totalRealEntriesChecked: number; wouldHaveBlockedCount: number };
+  acquireExecutionLock: (symbol: string) => boolean;
+  isWeexApiSupported: (symbol: string) => boolean;
+  getCcxtClient: (config: any) => any;
+  fetchCachedRealBalance: (client: any, type: string, force: boolean, context: string) => Promise<any>;
+  executeRealOpenOnExchange: (symbol: string, side: 'LONG' | 'SHORT', amount: number, leverage: number, oteOptions?: { targetPrice: number; timeoutMs?: number }) => Promise<any>;
+  setRealTradeSlTpOnExchange: (symbol: string, side: 'LONG' | 'SHORT', stopLoss?: number, takeProfit?: number) => Promise<boolean>;
+  saveTradeDB: (trade: any, immediate?: boolean) => Promise<void>;
+  saveBalanceDB: () => Promise<void>;
+  saveSettings: () => Promise<void>;
+  sendTelegramMessage: (text: string) => void;
+  getAtomicStoreRevision: () => number;
+  executeMainVirtualAutoEntry: (params: any, options: any) => Promise<any>;
+  executeMainRealAutoEntry: (params: any, options: any) => Promise<any>;
+  getLossStreakSizeDampening: (trades: any[]) => number;
+  getWallAdjustedTp: (symbol: string, isSell: boolean, entry: number, target: number) => number;
+  getAiKnowledgeBase?: () => any[];
+  calculateConfidenceProbability?: (symbol: string, currentPrice: number, volume: number) => { p: number; features: number[] };
+}
+
+export interface CandidateQueueOptions {
+  allowedTradingDirections?: string;
+  activeLongCount?: number;
+  activeShortCount?: number;
+}
+
+/**
+ * Robust numerical price formatter that prevents truncation to 0 for small crypto assets
+ */
+export function formatNumericPrice(p: number): number {
+  if (!p || isNaN(p) || p <= 0) return p;
+  if (p < 0.0001) return Number(p.toPrecision(6));
+  if (p < 1) return Number(p.toFixed(6));
+  return Number(p.toFixed(5));
+}
+
+/**
+ * Builds a balanced, interleaved 50/50 candidate queue for execution.
+ * Ensures neither LONG nor SHORT can monopolize execution slots merely by having higher individual aiScores,
+ * and prioritizes the lagging direction if there is an existing position imbalance.
+ */
+export function buildBalancedCandidateQueue(rawSignals: any[], options?: CandidateQueueOptions): any[] {
+  if (!Array.isArray(rawSignals) || rawSignals.length === 0) return [];
+
+  const allowedDir = options?.allowedTradingDirections || 'BOTH';
+  const longCandidates = allowedDir === 'SHORT_ONLY'
+    ? []
+    : rawSignals.filter((s: any) => s && (s.signal === 'LONG' || (s.signal && s.signal.includes('BUY'))));
+  const shortCandidates = allowedDir === 'LONG_ONLY'
+    ? []
+    : rawSignals.filter((s: any) => s && (s.signal === 'SHORT' || (s.signal && s.signal.includes('SELL'))));
+
+  longCandidates.sort((a: any, b: any) => (b.aiScore || 0) - (a.aiScore || 0));
+  shortCandidates.sort((a: any, b: any) => (b.aiScore || 0) - (a.aiScore || 0));
+
+  const activeLong = options?.activeLongCount ?? 0;
+  const activeShort = options?.activeShortCount ?? 0;
+  const prioritizeShort = activeShort < activeLong;
+
+  const balancedCandidateSignals: any[] = [];
+  const maxSignalCandidates = Math.max(longCandidates.length, shortCandidates.length);
+
+  for (let i = 0; i < maxSignalCandidates; i++) {
+    if (prioritizeShort) {
+      if (i < shortCandidates.length) balancedCandidateSignals.push(shortCandidates[i]);
+      if (i < longCandidates.length) balancedCandidateSignals.push(longCandidates[i]);
+    } else {
+      if (i < longCandidates.length) balancedCandidateSignals.push(longCandidates[i]);
+      if (i < shortCandidates.length) balancedCandidateSignals.push(shortCandidates[i]);
+    }
+    // Limit to the most reliable high-confidence candidates (max 6 balanced candidates)
+    if (balancedCandidateSignals.length >= 6) {
+      break;
+    }
+  }
+
+  return balancedCandidateSignals.slice(0, 6);
+}
+
+export async function runAutopilotAndVirtualTradeEntry(deps: AutoPilotEngineDependencies): Promise<void> {
+  try {
+    const globalSettings = deps.getGlobalSettings();
+    if (!globalSettings.isAutopilotEnabled) {
+      return;
+    }
+    if (isEntryPaused(undefined, { getGlobalTrueOhlcv: deps.getGlobalTrueOhlcv, getGlobalSettings: deps.getGlobalSettings }).paused) {
+      incFunnel('autopilot', 'entry_paused');
+      return;
+    }
+    const cacheSignals = deps.getCacheSignals();
+    if (!cacheSignals || !Array.isArray(cacheSignals.data) || cacheSignals.data.length === 0) {
+      return;
+    }
+
+    const virtualTrades = deps.getVirtualTrades();
+    let virtualBalance = deps.getVirtualBalance();
+    const startOfDayBalance = deps.getStartOfDayBalance();
+
+    // Защита от остановки симулятора: если баланс упал ниже минимальной маржи при включенном автопилоте,
+    // автоматически пополняем виртуальный баланс, чтобы торговля никогда не останавливалась
+    if (globalSettings.isAutopilotEnabled && globalSettings.tradingMode === 'virtual' && virtualBalance < 25) {
+      virtualBalance = Math.max(500, startOfDayBalance || 500);
+      deps.setVirtualBalance(virtualBalance);
+      globalSettings.virtualBalance = virtualBalance;
+      deps.saveBalanceDB().catch(() => {});
+      console.log(`[VIRTUAL AUTOPILOT] Virtual balance auto-restored to $${virtualBalance} USDT for continuous simulation.`);
+    }
+
+    const GLOBAL_CCXT_TICKERS = deps.getGlobalCcxtTickers();
+    const GLOBAL_TRUE_OHLCV = deps.getGlobalTrueOhlcv();
+    const GLOBAL_ADX = deps.getGlobalAdx();
+    const GLOBAL_ATR = deps.getGlobalAtr();
+    const GLOBAL_ORDER_BOOK_HISTORY = deps.getGlobalOrderBookHistory();
+    const orderBookImbalance = deps.getOrderBookImbalance();
+    const GLOBAL_MARKET_PULSE = deps.getGlobalMarketPulse();
+    const prolivPeaks = deps.getProlivPeaks();
+    const autopilotFailedSymbols = deps.getAutopilotFailedSymbols();
+    const symbolsUndergoingRealOpen = deps.getSymbolsUndergoingRealOpen();
+    const isCircuitBreakerActive = deps.isCircuitBreakerActive();
+    const committeeVetoShadowStats = deps.committeeVetoShadowStats;
+
+    const targetIsAutoLearning = globalSettings.tradingMode !== 'virtual';
+    const marketRegime = cacheSignals.marketRegime || 'NEUTRAL';
+    const btcTrend24h = cacheSignals.btcTrend24h || 0;
+    
+    // Evaluate recent performance using a sliding window of the last 15 closed trades, allowing the system to recover or react quickly
+    const closedAuto = [...virtualTrades.filter(t => !!(t as any).isAutoLearning === !!targetIsAutoLearning && t.status === 'CLOSED')]
+      .sort((a, b) => (b.closeTime || 0) - (a.closeTime || 0))
+      .slice(0, 15);
+    const wonAuto = closedAuto.filter(t => (t.pnlPercent || 0) > 0).length;
+    const autoWinRate = closedAuto.length >= 3 ? wonAuto / closedAuto.length : 0.70;
+
+    // Считаем раздельно для реальных и виртуальных режимов
+    const autoWinRateForReal = autoWinRate;
+    const autoWinRateForVirtual = autoWinRate; // Динамически адаптируется под реальный винрейт контура
+
+    // 1. Параметры для виртуальных/обучающих сделок (всегда без ограничений согласно RULE[AGENTS_md])
+    let requiredAutoScoreVirtual = 78;
+    let maxAutoLeverageVirtual = 5;
+    let sizeMultiplierVirtual = 1.0;
+
+    if (autoWinRateForVirtual < 0.40) {
+        requiredAutoScoreVirtual = 82;
+        maxAutoLeverageVirtual = 3;
+        sizeMultiplierVirtual = 0.5;
+    } else if (autoWinRateForVirtual < 0.55) {
+        requiredAutoScoreVirtual = 80;
+        maxAutoLeverageVirtual = 4;
+        sizeMultiplierVirtual = 0.7;
+    } else if (autoWinRateForVirtual >= 0.75) {
+        requiredAutoScoreVirtual = 75;
+        maxAutoLeverageVirtual = 5;
+        sizeMultiplierVirtual = 1.25;
+    }
+
+    // 2. Параметры для реальных сделок (с полной защитой от просадок и убытков)
+    let requiredAutoScoreReal = 94;
+    let maxAutoLeverageReal = 5;
+    let sizeMultiplierReal = 1.0;
+
+    if (autoWinRateForReal < 0.40) {
+        requiredAutoScoreReal = 97;
+        maxAutoLeverageReal = 3;
+        sizeMultiplierReal = 0.4;
+    } else if (autoWinRateForReal < 0.55) {
+        requiredAutoScoreReal = 95;
+        maxAutoLeverageReal = 4;
+        sizeMultiplierReal = 0.7;
+    } else if (autoWinRateForReal >= 0.75) {
+        requiredAutoScoreReal = 93;
+        maxAutoLeverageReal = 5;
+        sizeMultiplierReal = 1.25;
+    }
+
+    // Корректировка по агрессивности для виртуальных и реальных
+    const aggressiveness = globalSettings.autopilotAggressiveness || 'conservative';
+    if (aggressiveness === 'moderate') {
+        requiredAutoScoreVirtual = Math.min(requiredAutoScoreVirtual, 88);
+        sizeMultiplierVirtual = Math.max(sizeMultiplierVirtual, 0.8);
+        maxAutoLeverageVirtual = Math.max(maxAutoLeverageVirtual, 5);
+
+        requiredAutoScoreReal = Math.min(requiredAutoScoreReal, 88);
+        sizeMultiplierReal = Math.max(sizeMultiplierReal, 0.8);
+        maxAutoLeverageReal = Math.max(maxAutoLeverageReal, 5);
+        console.log(`[META-LEARNING AUTOPILOT] Moderate aggressiveness applied. Required Score capped at 88. Virtual size multiplier: ${sizeMultiplierVirtual}, Real: ${sizeMultiplierReal}`);
+    } else if (aggressiveness === 'aggressive') {
+        // Смягчённый кап: агрессивный режим снижает порог относительно адаптивного значения,
+        // но больше не обнуляет полностью самозащиту при плохой полосе (адаптивное значение доходит до 97).
+        // Нижняя граница 75 сохранена — агрессивный режим всегда мягче Moderate (88) и Conservative (93).
+        requiredAutoScoreVirtual = Math.max(75, requiredAutoScoreVirtual - 15);
+        sizeMultiplierVirtual = Math.max(sizeMultiplierVirtual * 1.8, 1.2);
+        maxAutoLeverageVirtual = Math.max(maxAutoLeverageVirtual, 10);
+
+        requiredAutoScoreReal = Math.max(75, requiredAutoScoreReal - 15);
+        sizeMultiplierReal = Math.max(sizeMultiplierReal * 1.8, 1.2);
+        maxAutoLeverageReal = Math.max(maxAutoLeverageReal, 10);
+        console.log(`[META-LEARNING AUTOPILOT] Aggressive trading active! Required Score reduced to ${requiredAutoScoreReal}. Virtual size boost: ${sizeMultiplierVirtual}x, Real size boost: ${sizeMultiplierReal}x`);
+    } else {
+        requiredAutoScoreVirtual = Math.min(requiredAutoScoreVirtual, 93);
+        requiredAutoScoreReal = Math.min(requiredAutoScoreReal, 93);
+    }
+
+    if (globalSettings.aiMinConfidenceThreshold !== undefined) {
+        const userThresholdScore = Math.round(globalSettings.aiMinConfidenceThreshold * 100);
+        requiredAutoScoreVirtual = Math.min(requiredAutoScoreVirtual, userThresholdScore);
+        requiredAutoScoreReal = Math.min(requiredAutoScoreReal, userThresholdScore);
+    }
+
+    // Apply Loss Streak Size Dampening
+    const recentClosedVirtualForDampening = [...virtualTrades.filter(t => !!(t as any).isAutoLearning === !!targetIsAutoLearning && t.status === 'CLOSED')]
+      .sort((a, b) => (a.closeTime || 0) - (b.closeTime || 0))
+      .slice(-15);
+    const virtualDampening = deps.getLossStreakSizeDampening(recentClosedVirtualForDampening);
+    sizeMultiplierVirtual = sizeMultiplierVirtual * virtualDampening;
+
+    const recentClosedRealForDampening = [...virtualTrades.filter(t => t.isReal === true && t.mode === 'AUTO' && t.status === 'CLOSED')]
+      .sort((a, b) => (a.closeTime || 0) - (b.closeTime || 0))
+      .slice(-15);
+    const realDampening = deps.getLossStreakSizeDampening(recentClosedRealForDampening);
+    sizeMultiplierReal = sizeMultiplierReal * realDampening;
+
+    // Streak Protection checking
+    const recentHourAutos = virtualTrades.filter(t => 
+        !!(t as any).isAutoLearning === !!targetIsAutoLearning && 
+        t.status === 'CLOSED' && 
+        t.closeTime && 
+        (Date.now() - t.closeTime < 60 * 60 * 1000)
+    ).sort((a, b) => (b.closeTime || 0) - (a.closeTime || 0));
+
+    let streakLossesCount = 0;
+    for (const t of recentHourAutos) {
+        if ((t.pnlPercent || 0) < 0) {
+            streakLossesCount++;
+        } else {
+            break; // Streak interrupted by winning trade
+        }
+    }
+
+    const isStreakProtectionActiveForReal = streakLossesCount >= 3;
+    const streakSizeMultiplierForReal = isStreakProtectionActiveForReal ? 0.50 : 1.0;
+    const streakScoreBufferForReal = isStreakProtectionActiveForReal ? 6 : 0;
+
+    // Daily drawdown checks
+    const dailyChangePercent = startOfDayBalance > 0 ? ((virtualBalance - startOfDayBalance) / startOfDayBalance) * 100 : 0;
+    const dynamicDrawdownThreshold = virtualBalance <= 360.0 ? -6.0 : -15.0;
+    const isDailyLimitExceeded = dailyChangePercent <= dynamicDrawdownThreshold;
+
+    // 50/50 Balanced Queue: Ensure equal, symmetrical evaluation of LONG and SHORT signals
+    const activeLongCount = virtualTrades.filter(t => t.status === 'OPEN' && t.side === 'LONG').length;
+    const activeShortCount = virtualTrades.filter(t => t.status === 'OPEN' && t.side === 'SHORT').length;
+
+    const balancedCandidateSignals = buildBalancedCandidateQueue(cacheSignals.data || [], {
+        allowedTradingDirections: (globalSettings as any)?.allowedTradingDirections,
+        activeLongCount,
+        activeShortCount
+    });
+
+    for (const currentSig of balancedCandidateSignals) {
+        // Жесткий глобальный лимит: если в системе уже 6 или более открытых сделок — прекращаем цикл входа
+        const currentTotalOpen = virtualTrades.filter(t => t.status === 'OPEN').length;
+        const configuredMaxLimit = (globalSettings as any).maxActivePositionsVirtual !== undefined ? Number((globalSettings as any).maxActivePositionsVirtual) : 6;
+        const maxCapacityAllowed = Math.min(6, Math.max(2, configuredMaxLimit || 6));
+        if (currentTotalOpen >= maxCapacityAllowed) {
+            break;
+        }
+
+        if (!currentSig || currentSig.signal === 'NEUTRAL' || (currentSig.aiScore || 0) < 70) continue;
+        const symbol = currentSig.rawSymbol || currentSig.symbol;
+        if (!symbol || typeof symbol !== 'string') continue;
+        try { incFunnel('seen', 'evaluating_candidate', symbol); } catch {}
+        const price = currentSig.price;
+        const exName = currentSig.exchange;
+        let finalAiScore = currentSig.aiScore;
+        const volatility = typeof currentSig.volatility !== 'undefined' ? Number(currentSig.volatility) : 2.0;
+
+        // --- КВАНТОВОЕ АВТО-ОБУЧЕНИЕ: ПРОВЕРКА ПРАВИЛ БАЗЫ ЗНАНИЙ ---
+        const aiKnowledgeBase = deps.getAiKnowledgeBase ? deps.getAiKnowledgeBase() : [];
+        const currentMarketPulse = deps.getGlobalMarketPulse ? deps.getGlobalMarketPulse() : { bias: 0 };
+        const kbDedupeCapEnabled = (globalSettings as any).kbDedupeCap === true;
+        const kbEval = evaluateKnowledgeBaseForSignal(
+            symbol,
+            {
+                rsi: currentSig.rsi !== undefined ? Number(currentSig.rsi) : (currentSig?.indicators?.rsi1h !== undefined ? Number(currentSig.indicators.rsi1h) : undefined),
+                volumeSpike: Number(currentSig.volumeSpike) || undefined,
+                bias: currentMarketPulse?.bias,
+                volatility,
+                imbalance: orderBookImbalance[normalizeSymbol(symbol)]?.imbalance,
+                change24h: Number(currentSig.change24h) || undefined
+            },
+            aiKnowledgeBase,
+            { dedupeCap: kbDedupeCapEnabled }
+        );
+
+        if (kbEval.isBlocked) {
+            try { incFunnel('kb_block', kbEval.blockReason || 'knowledge_rule_blocked', symbol); } catch {}
+            console.log(`[AUTOPILOT KNOWLEDGE GUARD] Skipping entry for ${symbol}: ${kbEval.blockReason}`);
+            continue;
+        }
+
+        if (kbEval.penaltyScore > 0) {
+            const penalizedScore = Math.max(0, finalAiScore - kbEval.penaltyScore);
+            console.log(`[AUTOPILOT KNOWLEDGE PENALTY] Candidate ${symbol} penalized: score ${finalAiScore} -> ${penalizedScore} (-${kbEval.penaltyScore} pts from learned rules)`);
+            finalAiScore = penalizedScore;
+            if (finalAiScore < (requiredAutoScoreVirtual || 70)) {
+                try { incFunnel('kb_penalty_reject', 'score_below_threshold_after_penalty', symbol); } catch {}
+                continue;
+            }
+        } else if (kbEval.bonusScore > 0) {
+            finalAiScore = Math.min(100, finalAiScore + kbEval.bonusScore);
+        }
+
+        // --- КВАНТОВАЯ ЛОГИСТИЧЕСКАЯ РЕГРЕССИЯ (MODEL WEIGHTS BETA0..BETA11) ---
+        let entryQuantP: number | undefined;
+        let currentQuantFeatures: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        if (deps.calculateConfidenceProbability) {
+            try {
+                const quantProb = deps.calculateConfidenceProbability(symbol, price, currentSig.volume || 0);
+                if (quantProb && typeof quantProb.p === 'number') {
+                    entryQuantP = quantProb.p;
+                    if (Array.isArray(quantProb.features)) {
+                        currentQuantFeatures = quantProb.features;
+                        currentSig.features = currentQuantFeatures;
+                    }
+                    const probDiff = quantProb.p - 0.5;
+                    const probAdjustment = Math.round(probDiff * 24); // -12 до +12 пунктов
+                    if (probAdjustment !== 0) {
+                        const scoreBefore = finalAiScore;
+                        finalAiScore = Math.max(0, Math.min(100, finalAiScore + probAdjustment));
+                        console.log(`[QUANT LOGISTIC MODEL] ${symbol}: p=${(quantProb.p * 100).toFixed(1)}% -> AI Score adjusted ${scoreBefore} -> ${finalAiScore} (${probAdjustment > 0 ? '+' : ''}${probAdjustment} pts)`);
+                    }
+                    if (quantProb.p < 0.32) {
+                        try { incFunnel('quant_guard', 'win_prob_below_32pct', symbol); } catch {}
+                        console.log(`[QUANT LOGISTIC GUARD] Skipping entry for ${symbol}: Win probability ${(quantProb.p * 100).toFixed(1)}% is below 32% safety threshold.`);
+                        continue;
+                    }
+                }
+            } catch (probErr: any) {
+                // Non-blocking graceful fallback
+            }
+        }
+
+        const isSellSignal = currentSig.signal && (currentSig.signal.includes('SELL') || currentSig.signal.includes('SHORT'));
+        const isBuySignal = currentSig.signal && (currentSig.signal.includes('BUY') || currentSig.signal.includes('LONG'));
+
+        // --- STRICT SIGNAL QUALITY & PATTERN FILTER ---
+        const rawPatternName = currentSig.matchedPattern || currentSig.patternName || currentSig.type || currentSig.pattern || '';
+        const blCheck = isPatternBlacklisted(rawPatternName);
+        if (blCheck.blacklisted) {
+            try { incFunnel('blacklist', blCheck.reason || 'pattern_blacklisted', symbol); } catch {}
+            console.log(`[AUTOPILOT BLACKLIST GUARD] Skipping entry for ${symbol}: Pattern "${rawPatternName}" is blacklisted (${blCheck.reason})`);
+            continue;
+        }
+
+        // --- СЕССИОННЫЙ ФИЛЬТР И ВРЕМЕННЫЕ ОКНА ЛИКВИДНОСТИ ---
+        if (globalSettings.isSessionFilterEnabled) {
+            const sessionVerdict = evaluateSessionFilter(Date.now(), globalSettings, isSellSignal ? 'SHORT' : 'LONG');
+            if (!sessionVerdict.allowed) {
+                try { incFunnel('session_filter', sessionVerdict.reason || 'session_blocked', symbol); } catch {}
+                console.log(`[AUTOPILOT SESSION GUARD] Skipping entry for ${symbol}: ${sessionVerdict.reason}`);
+                continue;
+            }
+            if (sessionVerdict.scoreAdjustment && sessionVerdict.scoreAdjustment !== 0) {
+                const scoreBefore = finalAiScore;
+                finalAiScore = Math.max(0, Math.min(100, finalAiScore + sessionVerdict.scoreAdjustment));
+                console.log(`[AUTOPILOT SESSION ADAPTIVE] ${symbol}: Session ${sessionVerdict.session} (${sessionVerdict.hourUtc}:00 UTC) adjusted AI score ${scoreBefore} -> ${finalAiScore} (${sessionVerdict.scoreAdjustment > 0 ? '+' : ''}${sessionVerdict.scoreAdjustment} pts)`);
+            }
+        }
+
+        // --- БЛОК C: AGGREGATED LEARNING CELLS (SHADOW / ACTIVE / OFF) ---
+        let currentCellVerdict: any = null;
+        try {
+            const aggMode = (globalSettings as any).aggregatedLearningMode ?? 'SHADOW';
+            if (aggMode !== 'OFF') {
+                currentCellVerdict = getCellVerdict({
+                    pattern: rawPatternName,
+                    side: isSellSignal ? 'SHORT' : 'LONG',
+                    regime: marketRegime,
+                    settings: globalSettings
+                });
+
+                if (aggMode === 'SHADOW') {
+                    if (currentCellVerdict.verdict === 'BLOCK' || currentCellVerdict.wouldBlockIfFullPolicy) {
+                        try { incFunnel('cell', 'would_block', symbol); } catch {}
+                    } else if (currentCellVerdict.verdict === 'PENALIZE') {
+                        try { incFunnel('cell', 'would_penalize', symbol); } catch {}
+                    } else if (currentCellVerdict.verdict === 'BOOST') {
+                        try { incFunnel('cell', 'would_boost', symbol); } catch {}
+                    }
+                } else if (aggMode === 'ACTIVE') {
+                    if (currentCellVerdict.verdict === 'BLOCK') {
+                        try { incFunnel('cell', 'blocked', symbol); } catch {}
+                        console.log(`[LEARNING CELL GUARD] Skipping entry for ${symbol}: Blocked by cell "${currentCellVerdict.cellKey}" (${currentCellVerdict.reason})`);
+                        continue;
+                    }
+                    if (typeof currentCellVerdict.adjustment === 'number' && currentCellVerdict.adjustment !== 0) {
+                        const scoreBefore = finalAiScore;
+                        finalAiScore = Math.max(0, Math.min(100, finalAiScore + currentCellVerdict.adjustment));
+                        console.log(`[LEARNING CELL ACTIVE] ${symbol}: cell "${currentCellVerdict.cellKey}" (${currentCellVerdict.verdict}) adjusted AI score ${scoreBefore} -> ${finalAiScore} (${currentCellVerdict.adjustment > 0 ? '+' : ''}${currentCellVerdict.adjustment} pts)`);
+                    }
+                }
+            }
+        } catch (cellErr: any) {
+            // Graceful non-blocking fallback: behavior stays exactly as before
+            console.warn('[LEARNING CELL EVALUATION ERROR]:', cellErr?.message || cellErr);
+        }
+
+        // Rolling win rate check over the last 20 trades via SignalPerformanceAnalyticsService (< 45% threshold)
+        // Для виртуального режима и фонового авто-обучения (согласно RULE[AGENTS_md]) блокировки по прошлой просадке отключены
+        if (!targetIsAutoLearning && globalSettings.tradingMode === 'real') {
+            const rollingPerf = SignalPerformanceAnalyticsService.evaluatePatternRollingPerformance(virtualTrades, rawPatternName, 20);
+            if (!rollingPerf.allowed) {
+                try { incFunnel('rolling_wr', rollingPerf.reason || 'rolling_winrate_low', symbol); } catch {}
+                console.log(`[AUTOPILOT ROLLING WINRATE GUARD] Skipping real entry for ${symbol}: ${rollingPerf.reason}`);
+                continue;
+            }
+        }
+
+        // Disallow entries into unclassified / low-conviction signals lacking volume spike or verified core pattern
+        const sigType = (currentSig.type || currentSig.sctoPattern || currentSig.pattern || '').toUpperCase();
+        const hasVerifiedPattern = sigType.includes('SAR') || sigType.includes('SPIRE') || sigType.includes('WICK') || 
+                                   sigType.includes('BOS') || sigType.includes('PUMP') || sigType.includes('PARABOLIC') || 
+                                   sigType.includes('STAGNATION') || sigType.includes('РЕВЕРС') || sigType.includes('РЕТЕСТ') ||
+                                   sigType.includes('LIQUIDITY') || sigType.includes('SWEEP') || sigType.includes('ИДЕАЛЬНЫЙ') ||
+                                   (Array.isArray(currentSig.matchedRuleIds) && currentSig.matchedRuleIds.length > 0);
+        const hasVolumeConfirmation = (Number(currentSig.volumeSpike) || 0) >= 1.3 || (Number(currentSig.volume24h) || Number(currentSig.volume) || 0) >= 200000;
+        
+        if (!hasVerifiedPattern && !hasVolumeConfirmation && finalAiScore < 88) {
+            try { incFunnel('no_verified_pattern', 'unclassified_stagnant_signal', symbol); } catch {}
+            continue; // Skip unclassified stagnant signals to protect win-rate
+        }
+
+        // --- HARD BLOCK ON CONSENSUS REJECT & STRATEGY CHECKLIST ---
+        const isCommitteeConsensusEnabled = (globalSettings as any).isCommitteeConsensusCheckEnabled !== false;
+        if (currentSig.decisionTrace && isCommitteeConsensusEnabled) {
+            const dt = currentSig.decisionTrace;
+            const requiredScore = typeof dt.requiredScore === 'number' ? dt.requiredScore : 75;
+            if (dt.passedConsensus === false || (typeof dt.consensusScore === 'number' && dt.consensusScore < requiredScore)) {
+                try { incFunnel('shield_consensus', 'committee_consensus_low', symbol); } catch {}
+                console.log(`[AUTOPILOT CONSENSUS GUARD] Rejected entry for ${symbol}: Consensus score ${dt.consensusScore} < ${requiredScore} or passedConsensus is false`);
+                continue;
+            }
+        }
+
+        if (currentSig.decisionTrace) {
+            const dt = currentSig.decisionTrace;
+            // Mandatory checklist rule: Liquidity Sweep verification
+            if (globalSettings.isLiquiditySweepFilterEnabled !== false) {
+                const liquidityFactor = dt.factors?.find((f: any) => f.name === 'LIQUIDITY_SWEEP');
+                if (liquidityFactor && liquidityFactor.passed === false) {
+                    try { incFunnel('shield_liquidity_sweep', 'liquidity_sweep_unconfirmed', symbol); } catch {}
+                    console.log(`[AUTOPILOT CHECKLIST GUARD] Skipping entry for ${symbol}: LIQUIDITY_SWEEP unconfirmed (waiting for liquidity sweep)`);
+                    continue;
+                }
+            }
+
+            // Mandatory checklist rule: Candlestick Wick Rejection verification
+            // Strict wick rejection is enforced for Spire / Wick Retest / Pinbar setups.
+            // For SAR Reversal / Structure Shift (BOS/ChoCh), confirmed structural reversal satisfies entry.
+            const wickFactor = dt.factors?.find((f: any) => f.name && f.name.includes('WICK_REJECTION'));
+            const isStrictWickPattern = sigType.includes('SPIRE') || sigType.includes('WICK') || sigType.includes('PINBAR') || sigType.includes('ШПИЛЬ') || sigType.includes('ФИТИЛ');
+            if (isStrictWickPattern && wickFactor && wickFactor.passed === false) {
+                try { incFunnel('shield_wick', 'wick_rejection_unconfirmed', symbol); } catch {}
+                console.log(`[AUTOPILOT CHECKLIST GUARD] Skipping entry for ${symbol}: WICK_REJECTION unconfirmed for wick pattern`);
+                continue;
+            }
+        }
+        
+        // --- RISK CONTROLS ---
+        // BTC hyper-growth (Защита от открытия шортов при вертикальном росте BTC)
+        const isBtcHyperGrowth = btcTrend24h > 5.0;
+        if (isBtcHyperGrowth && (currentSig.signal.includes('SELL') || currentSig.signal.includes('SHORT'))) {
+            try { incFunnel('shield_btc_hypergrowth', 'btc_hypergrowth_short_blocked', symbol); } catch {}
+            continue;
+        }
+
+        // BTC Panic / Flash Crash (Защита от открытия лонгов при обвале BTC)
+        const isBtcPanic = btcTrend24h < -5.0;
+        if (isBtcPanic && (currentSig.signal.includes('BUY') || currentSig.signal.includes('LONG'))) {
+            try { incFunnel('shield_btc_panic', 'btc_panic_long_blocked', symbol); } catch {}
+            continue;
+        }
+
+        // Bullish / Bearish Expansion guards
+        const isBullishExpansion = marketRegime === 'BULL_TREND' || marketRegime === 'PUMP';
+        if (isBullishExpansion && finalAiScore < 85 && (currentSig.signal.includes('SELL') || currentSig.signal.includes('SHORT'))) {
+            try { incFunnel('shield_bull_expansion', 'bull_expansion_short_low_score', symbol); } catch {}
+            continue;
+        }
+        if (isTraditionalEquitySymbol(symbol)) {
+            try { incFunnel('shield_traditional_equity', 'traditional_equity_symbol', symbol); } catch {}
+            continue; // Skip traditional stock equities (DELL, AAL, CRM, etc.) from crypto scalp engine
+        }
+
+        const isBearishExpansion = marketRegime === 'BEAR_TREND' || marketRegime === 'DUMP';
+        if (isBearishExpansion && finalAiScore < 85 && (currentSig.signal.includes('BUY') || currentSig.signal.includes('LONG'))) {
+            try { incFunnel('shield_bear_expansion', 'bear_expansion_long_low_score', symbol); } catch {}
+            continue;
+        }
+
+        // Spread & Volatility protection (Защита от спреда и низкой ликвидности для всех направлений)
+        const ticker = GLOBAL_CCXT_TICKERS[exName]?.[symbol];
+        const ask = ticker?.ask || ticker?.close || price;
+        const bid = ticker?.bid || ticker?.close || price;
+        const currentSpreadPct = bid > 0 ? ((ask - bid) / bid) * 100 : 0;
+        if (currentSpreadPct > 0.25 && finalAiScore < 95) {
+            try { incFunnel('shield_spread', 'wide_spread_pair', symbol); } catch {}
+            continue; // Skip wide spread pairs to prevent entry slippage loss
+        }
+
+        // Universal Volume Shield (Защита от безимпульсных малоликвидных монет):
+        // Согласно правилу RULE[AGENTS_md]: Фильтрация мусора: Игнорировать монеты с объемом < 50,000$ (если нет аномального всплеска > 4x).
+        // ЛЕГАСИ-ЛОГИКА: ранее отсекались монеты с volume24h < 200000 при volumeSpike < 1.8, что блокировало качественные сетапы с объемами 50k-200k.
+        const volume24h = Number(currentSig.volume24h) || Number(currentSig.volume) || 0;
+        const volumeSpike = Number(currentSig.volumeSpike) || 0;
+        if (volume24h > 0 && volume24h < 50000 && volumeSpike < 4.0) {
+            try { incFunnel('shield_volume', 'low_volume_stagnant_coin', symbol); } catch {}
+            continue; // Ignore low-volume stagnant coins without volume spike
+        }
+
+        // LONG Risk Controls (Защита лонгов от ловли падающих ножей):
+        const isBuySignalCheck = currentSig.signal && (currentSig.signal.includes('BUY') || currentSig.signal.includes('LONG'));
+        if (isBuySignalCheck) {
+            // 1. Игнорировать лонги при глубоком проливе цены под VWAP (> 0.8% ниже VWAP) без подтвержденного разворота
+            const sigVwap = currentSig.indicators?.vwap || currentSig.vwap;
+            if (sigVwap && price < sigVwap * 0.992 && !currentSig.volumeSpike && (Number(currentSig.riseFromLow) || 0) < 1.5) {
+                try { incFunnel('shield_long_vwap', 'falling_knife_below_vwap', symbol); } catch {}
+                console.log(`[AUTOPILOT LONG SHIELD] Ignored ${symbol} falling knife LONG: price ${price} is below VWAP ${sigVwap} without reversal confirmation`);
+                continue;
+            }
+
+            // 2. В падающем/медвежьем рынке для LONG требуется повышенный балл или подтвержденный разворотный импульс
+            const isBearishRegime = marketRegime === 'BEAR_TREND' || marketRegime === 'PANIC_DUMP' || btcTrend24h < -2.5;
+            if (isBearishRegime && finalAiScore < 92 && !currentSig.volumeSpike && (Number(currentSig.riseFromLow) || 0) < 2.0) {
+                try { incFunnel('shield_bear_regime_long', 'bearish_market_long_low_score', symbol); } catch {}
+                console.log(`[AUTOPILOT LONG SHIELD] Ignored ${symbol} LONG in Bearish Market: score ${finalAiScore} < 92 without volume spike or reversal rise`);
+                continue;
+            }
+        }
+
+        // High volatility & wide daily range leverage cap (reduction to 4x-5x on volatile coins)
+        const absChange24h = Math.abs(Number(currentSig.change24h) || 0);
+        const isHighVolatilityAsset = volatility >= 5.0 || absChange24h >= 7.0;
+
+        let adaptiveLeverageVirtual = maxAutoLeverageVirtual;
+        let adaptiveLeverageReal = maxAutoLeverageReal;
+
+        if (isHighVolatilityAsset) {
+            adaptiveLeverageVirtual = Math.min(4, Math.max(2, Math.round(maxAutoLeverageVirtual * 0.4)));
+            adaptiveLeverageReal = Math.min(4, Math.max(2, Math.round(maxAutoLeverageReal * 0.4)));
+            console.log(`[LEVERAGE VOLATILITY CAP] High volatility detected for ${symbol} (vol: ${volatility}, 24h: ${absChange24h}%). Leverage capped to ${adaptiveLeverageVirtual}x.`);
+        } else if (volatility > 3.5 || absChange24h >= 4.0) {
+            adaptiveLeverageVirtual = Math.min(6, Math.max(2, Math.round(maxAutoLeverageVirtual * 0.6)));
+            adaptiveLeverageReal = Math.min(6, Math.max(2, Math.round(maxAutoLeverageReal * 0.6)));
+        }
+
+        const normalizedSymbol = normalizeSymbol(symbol);
+        const cleanSymNorm = normalizedSymbol;
+
+        // POINT 2: Choppy Market Guard (ADX Check)
+        const sigAdx = GLOBAL_ADX[cleanSymNorm] || GLOBAL_TRUE_OHLCV[cleanSymNorm]?.adx15m || 25;
+        let choppinessRequiredScore = 0;
+        if (sigAdx < 18) {
+            choppinessRequiredScore = 78; // Require at least 78% score in flat/choppy markets
+        }
+
+        const sigRequiredOverride = currentSig.sctoRequiredScoreOverride || 0;
+        const dynamicRequiredAutoScoreVirtual = Math.max(sigRequiredOverride, requiredAutoScoreVirtual, choppinessRequiredScore);
+        const dynamicRequiredAutoScoreReal = Math.max(sigRequiredOverride, isStreakProtectionActiveForReal ? Math.min(98, requiredAutoScoreReal + streakScoreBufferForReal) : requiredAutoScoreReal, choppinessRequiredScore);
+
+        // POINT 3: Orderbook Depth Ratio Check
+        const obInfo = orderBookImbalance[cleanSymNorm];
+        if (obInfo && (obInfo.bidVolume > 0 || obInfo.askVolume > 0)) {
+            const bidVol = obInfo.bidVolume || 1;
+            const askVol = obInfo.askVolume || 1;
+            const isReversalPattern = sigType.includes('SPIRE') || sigType.includes('REVERSAL') || sigType.includes('DIP') || 
+                                      sigType.includes('PEAK') || sigType.includes('OVERSOLD') || sigType.includes('OVERBOUGHT') || 
+                                      sigType.includes('CLIMAX') || sigType.includes('WICK') || sigType.includes('ШПИЛЬ') || 
+                                      sigType.includes('ПРОЛИВ') || sigType.includes('СЛИВ') || sigType.includes('РЕТЕСТ');
+            const minAskToBidRatio = isReversalPattern ? 0.35 : 0.60;
+            const minBidToAskRatio = isReversalPattern ? 0.40 : 0.85;
+
+            if (isSellSignal && (askVol / bidVol) < minAskToBidRatio) {
+                try { incFunnel('shield_orderbook', 'orderbook_imbalance_short_reject', symbol); } catch {}
+                console.log(`[ORDERBOOK SHIELD] Skipping auto SHORT for ${symbol}: Bid density (${bidVol.toFixed(0)}) dominates Ask (${askVol.toFixed(0)}), ratio ${(askVol/bidVol).toFixed(2)} < ${minAskToBidRatio}`);
+                continue;
+            }
+            if (isBuySignal && (bidVol / askVol) < minBidToAskRatio) {
+                try { incFunnel('shield_orderbook', 'orderbook_imbalance_long_reject', symbol); } catch {}
+                console.log(`[ORDERBOOK SHIELD] Skipping auto LONG for ${symbol}: Ask density (${askVol.toFixed(0)}) dominates Bid (${bidVol.toFixed(0)}), ratio ${(bidVol/askVol).toFixed(2)} < ${minBidToAskRatio}`);
+                continue;
+            }
+        }
+
+        // 1. VIRTUAL / AUTO LEARNING ENTRY
+        // Синхронизация контуров: в реальном режиме виртуальные фоновые сделки открываются ТОЛЬКО если явно включено параллельное обучение (isParallelAutoLearningEnabled),
+        // исключая нежелательное открытие 12 сделок одновременно (6 виртуальных + 6 реальных).
+        const allowVirtualEntry = globalSettings.tradingMode === 'virtual' || (globalSettings as any).isParallelAutoLearningEnabled === true;
+        if (allowVirtualEntry && finalAiScore >= dynamicRequiredAutoScoreVirtual && (isSellSignal || isBuySignal)) {
+            const existingAutoTrade = virtualTrades.find(t => {
+                const tNorm = normalizeSymbol(t.symbol);
+                return t.status === 'OPEN' && tNorm === normalizedSymbol && !!(t as any).isAutoLearning === !!targetIsAutoLearning;
+            });
+
+            // Кулдаун по минусовым/закрытым сделкам применяется ИСКЛЮЧИТЕЛЬНО при торговле на РЕАЛЬНОМ балансе!
+            // Для виртуального баланса (авто-обучения) кулдаун полностью отключен.
+            const recentlyClosedAuto = undefined;
+
+            // Жесткое совокупное ограничение: во всей системе не более 6 открытых сделок одновременно!
+            const totalOpenTradesCount = virtualTrades.filter(t => t.status === 'OPEN').length;
+            const activeVirtualCount = virtualTrades.filter(t => t.status === 'OPEN' && (t.isReal ? !targetIsAutoLearning : true)).length;
+            
+            // Balanced capacity: target 6 positions (3 LONG + 3 SHORT) — жесткий глобальный лимит не более 6
+            const configuredMax = (globalSettings as any).maxActivePositionsVirtual !== undefined ? Number((globalSettings as any).maxActivePositionsVirtual) : 6;
+            const maxVirtualPositions = Math.min(6, Math.max(2, configuredMax || 6));
+            
+            const isVirtualLimitReached = totalOpenTradesCount >= maxVirtualPositions || activeVirtualCount >= maxVirtualPositions;
+
+            const sameDirVirtualCount = virtualTrades.filter(t => 
+                t.status === 'OPEN' && 
+                t.side === (isSellSignal ? 'SHORT' : 'LONG')
+            ).length;
+
+            // Strict directional quota: exactly half the limit (3 of 6) to eliminate one-sided skew
+            const maxSameDir = (globalSettings as any)?.maxSameDirectionPositions !== undefined
+                ? Math.min(3, Math.max(1, Number((globalSettings as any).maxSameDirectionPositions)))
+                : Math.max(1, Math.min(3, Math.ceil(maxVirtualPositions / 2)));
+            const isSameDirLimitReached = sameDirVirtualCount >= maxSameDir;
+
+            if (isVirtualLimitReached) {
+                try { incFunnel('capacity', 'virtual_total_capacity_reached', symbol); } catch {}
+                console.log(`[AUTOPILOT CAPACITY GUARD] Virtual auto-trade for ${symbol} skipped: Total open positions limit reached (${totalOpenTradesCount}/${maxVirtualPositions})`);
+                continue;
+            }
+
+            if (isSameDirLimitReached && !existingAutoTrade && !recentlyClosedAuto) {
+                try { incFunnel('capacity', 'virtual_same_direction_limit_reached', symbol); } catch {}
+                console.log(`[RISK ACTUATOR] Virtual auto-trade for ${symbol} blocked: Max active positions in the same direction reached (${sameDirVirtualCount}/${maxSameDir})`);
+                continue;
+            }
+
+            if (!isVirtualLimitReached && !isSameDirLimitReached && !existingAutoTrade && !recentlyClosedAuto) {
+                if (!deps.acquireExecutionLock(symbol)) {
+                    try { incFunnel('exec_lock', 'concurrent_execution_lock_active', symbol); } catch {}
+                    console.log(`[VIRTUAL AUTOPILOT] [LOCK] Skip entry for ${symbol}: Concurrent transaction lock is active.`);
+                    continue;
+                }
+                // Open new virtual trade
+                const tradeId = `AL-${Date.now()}-${Math.floor(Math.random() * 10000).toString(36).toUpperCase()}`;
+                const cachedIndicators = GLOBAL_TRUE_OHLCV[normalizeSymbol(symbol)] || {};
+                const atr = currentSig.atr ? Number(currentSig.atr) : (GLOBAL_ATR[normalizeSymbol(symbol)] || (price * 0.015));
+
+                const signalVol = volatility;
+                const slippagePercent = Math.min(0.0015, 0.0005 * (1 + Math.max(0, signalVol - 2.0) * 0.15));
+                const slippagePrice = isSellSignal ? formatNumericPrice(price * (1 - slippagePercent)) : formatNumericPrice(price * (1 + slippagePercent));
+
+                // Реалистичная точка входа по рыночному исполнению (без искусственного завышения цен входа, искажающего PnL)
+                const optimizedEntryPrice = slippagePrice;
+
+                const autoVolSqueezeFactor = (currentSig.atr && price > 0) ? Math.max(0.5, Math.min(1.8, (Number(currentSig.atr) / price * 100) / 1.75)) : 1.0;
+                // Реалистичные цели скальпинга согласно правилу «3-15» базы знаний:
+                // TP1: 1.3%..1.6% (перенос SL в безубыток при подтверждении импульса)
+                // TP2: 2.2%..2.7% (фиксация прибыли)
+                // TP3: 3.3%..4.0% (фиксация импульса)
+                // TP4: 4.5%..6.0% (полный выход из позиции)
+                const dAutoTp1 = Math.max(1.30, 1.60 * autoVolSqueezeFactor);
+                const dAutoTp2 = Math.max(2.20, 2.70 * autoVolSqueezeFactor);
+                const dAutoTp3 = Math.max(3.30, 4.00 * autoVolSqueezeFactor);
+                const dAutoTp4 = Math.max(4.50, Math.min(6.50, 5.50 * autoVolSqueezeFactor));
+
+                // Structural Stop-Loss (привязанный к localLow5m/localHigh5m и буферу ATR)
+                const structuralSlVirtual = calculateStructuralStopLoss({
+                    isSellSignal,
+                    referencePrice: optimizedEntryPrice,
+                    localLow5m: cachedIndicators.localLow5m ?? price,
+                    localHigh5m: cachedIndicators.localHigh5m ?? price,
+                    atr,
+                    dAutoTp1OrDRealTp1: dAutoTp1
+                });
+                const slDistVal = optimizedEntryPrice * structuralSlVirtual.slPct;
+                const slPctVal = structuralSlVirtual.slPct;
+
+                const rewardToRiskVal = 2.0;
+                const kVal = calculateKelly(finalAiScore, rewardToRiskVal);
+                const virtualRiskBudget = virtualBalance * Math.max(0.1, kVal) * 0.05;
+                const targetVirtualPosVal = slPctVal > 0 ? (virtualRiskBudget / slPctVal) : (virtualBalance * Math.max(0.1, kVal));
+                
+                // Scale base position size and minimum size based on current virtualBalance
+                let minBaseSize = 20;
+                let maxPctOfBalance = 0.15;
+                if (virtualBalance <= 150) {
+                    minBaseSize = 10;
+                    maxPctOfBalance = 0.10;
+                } else if (virtualBalance <= 300) {
+                    minBaseSize = 15;
+                    maxPctOfBalance = 0.10;
+                } else if (virtualBalance <= 500) {
+                    maxPctOfBalance = 0.12;
+                }
+                const baseSize = Math.max(minBaseSize, Math.min(virtualBalance * maxPctOfBalance, targetVirtualPosVal));
+
+                const openAutoTradesNowCount = activeVirtualCount;
+                let portfolioOverexposureMultiplier = 1.0;
+                if (openAutoTradesNowCount >= 2 && openAutoTradesNowCount < 4) {
+                    portfolioOverexposureMultiplier = 0.70;
+                } else if (openAutoTradesNowCount >= 4) {
+                    portfolioOverexposureMultiplier = 0.50;
+                }
+
+                let challengeRiskMultiplier = 1.0; // Для виртуальных и обучающих сделок отключены любые ограничения по просадке баланса или точности сделок
+                const sctoSizeMult = currentSig.sctoSizeMultiplier || 1.0;
+
+                if (virtualBalance < 25) {
+                    const replenishedBal = Math.max(500, startOfDayBalance || 500);
+                    console.log(`[VIRTUAL AUTOPILOT] Virtual balance ($${virtualBalance.toFixed(2)}) is low. Replenishing to $${replenishedBal} USDT to prevent autopilot trade block.`);
+                    virtualBalance = replenishedBal;
+                    deps.setVirtualBalance(virtualBalance);
+                    globalSettings.virtualBalance = virtualBalance;
+                    deps.saveBalanceDB().catch(() => {});
+                }
+
+                let calculatedAmount = Number((baseSize * sizeMultiplierVirtual * portfolioOverexposureMultiplier * challengeRiskMultiplier * sctoSizeMult).toFixed(1));
+                const requiredMargin = calculatedAmount / adaptiveLeverageVirtual;
+                if (requiredMargin > virtualBalance * 0.95) {
+                    calculatedAmount = Number((virtualBalance * 0.95 * adaptiveLeverageVirtual).toFixed(1));
+                    if (calculatedAmount < 1.0) {
+                        calculatedAmount = Math.max(5.0, Number((virtualBalance * 0.5 * adaptiveLeverageVirtual).toFixed(1)));
+                    }
+                }
+
+                const autoImbVal = orderBookImbalance[normalizeSymbol(symbol)]?.imbalance ?? 50;
+                const autoRatios = calculateAdaptiveCloseRatios(autoImbVal, volatility);
+
+                // Structural TP Ladder (привязанный к swingHigh1h/swingLow1h)
+                const tpLadderVirtual = calculateStructuralTpLadder({
+                    isSellSignal,
+                    referencePrice: optimizedEntryPrice,
+                    swingHigh1h: cachedIndicators.swingHigh1h ?? price,
+                    swingLow1h: cachedIndicators.swingLow1h ?? price,
+                    dAutoTp4OrDRealTp4Floor: dAutoTp4
+                });
+
+                const rawTakeProfit = tpLadderVirtual.stage4;
+                const adjustedTakeProfit = deps.getWallAdjustedTp(symbol, isSellSignal, optimizedEntryPrice, rawTakeProfit);
+
+                const stage1Target = tpLadderVirtual.stage1;
+                const stage2Target = tpLadderVirtual.stage2;
+                const stage3Target = tpLadderVirtual.stage3;
+                const stage4Target = tpLadderVirtual.stage4;
+
+                const autoEntryPort: AutoEntryExecutionPort = {
+                    saveTradeDB: async (t, imm) => {
+                        await deps.saveTradeDB(t, imm);
+                    },
+                    saveBalanceDB: async () => {
+                        await deps.saveBalanceDB();
+                    },
+                    logStructured: (level, category, message, sym, meta) => {
+                        logStructured(level as any, category, message, sym, meta);
+                    },
+                    sendTelegramMessage: (text) => {
+                        deps.sendTelegramMessage(text);
+                    },
+                    getAtomicStoreRevision: () => deps.getAtomicStoreRevision(),
+                    reservePaperMargin: async (amountOrMargin: number, immutableTradeId: string, entryIntentId: string, correlationId: string, trade: any) => {
+                        const tradeLeverage = Math.max(1, Number(trade?.leverage || 1));
+                        const tradeNotional = Number(trade?.amount || amountOrMargin);
+                        const margin = trade?.margin
+                          ? Number(trade.margin)
+                          : (amountOrMargin === tradeNotional && tradeLeverage > 1
+                              ? Number((tradeNotional / tradeLeverage).toFixed(2))
+                              : Number(amountOrMargin.toFixed(2)));
+
+                        const tx = await executePaperTradeOpenTransaction(dbAtomicStore, {
+                            tradeId: immutableTradeId,
+                            entryIntentId,
+                            correlationId,
+                            margin,
+                            trade: {
+                                ...trade,
+                                amount: tradeNotional,
+                                initialAmount: tradeNotional,
+                                margin,
+                                initialMargin: margin,
+                                leverage: tradeLeverage
+                            },
+                            initialBalanceFallback: virtualBalance
+                        });
+                        if (tx.success) {
+                            virtualBalance = tx.newBalance;
+                            deps.setVirtualBalance(tx.newBalance);
+                            globalSettings.virtualBalance = tx.newBalance; // Authorized cache update after commit
+                            return { success: true, newBalance: tx.newBalance };
+                        }
+                        return { success: false, error: tx.error || 'INSUFFICIENT_VIRTUAL_BALANCE' };
+                    },
+                    releasePaperMargin: async (amount: number, pnl: number, immutableTradeId: string, closeEventId: string) => {
+                        if (!immutableTradeId || !closeEventId) {
+                            throw new Error('IMMUTABLE_TRADE_ID_AND_CLOSE_EVENT_ID_REQUIRED');
+                        }
+                        const tx = await executePaperTradeCloseTransaction(dbAtomicStore, {
+                            tradeId: immutableTradeId,
+                            closeEventId,
+                            closeRatio: 1.0,
+                            pnl: pnl || 0,
+                            isFullClose: true
+                        });
+                        if (tx.success) {
+                            virtualBalance = tx.newBalance;
+                            deps.setVirtualBalance(tx.newBalance);
+                            globalSettings.virtualBalance = tx.newBalance; // Authorized cache update after commit
+                            return { success: true, newBalance: tx.newBalance };
+                        }
+                        return { success: false, error: tx.error };
+                    },
+                    getAvailableVirtualBalance: () => {
+                        const state = dbAtomicStore.loadState<any>({});
+                        return state?.settings?.main?.virtualBalance ?? virtualBalance ?? 1000;
+                    }
+                };
+
+                const mainVirtualHunterTimestamp = Date.now();
+                const mainVirtualHunterDecision: AgentDecisionEnvelope = {
+                    decisionId: `hunter_main_v_${mainVirtualHunterTimestamp}_${Math.random().toString(36).substring(2, 7)}`,
+                    agentName: 'HUNTER',
+                    correlationId: `corr_mv_${mainVirtualHunterTimestamp}_${Math.random().toString(36).substring(2, 7)}`,
+                    proposedTradeId: `TR-${mainVirtualHunterTimestamp}-${Math.floor(Math.random() * 1000).toString(36).toUpperCase()}`,
+                    signalId: currentSig?.id || `sig_${mainVirtualHunterTimestamp}`,
+                    strategyId: (globalSettings as any).activeStrategy || 'ADAPTIVE_DYNAMIC',
+                    strategyVersion: '2.1.0',
+                    stateRevision: deps.getAtomicStoreRevision(),
+                    action: finalAiScore >= dynamicRequiredAutoScoreVirtual ? 'APPROVE' : 'NO_TRADE',
+                    confidence: finalAiScore,
+                    approved: finalAiScore >= dynamicRequiredAutoScoreVirtual,
+                    decisionSource: 'AI',
+                    rationale: currentSig?.rationale || currentSig?.pattern || `High-conviction pattern detected (Score: ${finalAiScore}%)`,
+                    createdAt: mainVirtualHunterTimestamp
+                };
+
+                const mainVirtualBearDecision: AgentDecisionEnvelope = {
+                    decisionId: `bear_main_v_${mainVirtualHunterTimestamp}_${Math.random().toString(36).substring(2, 7)}`,
+                    agentName: 'BEAR',
+                    correlationId: mainVirtualHunterDecision.correlationId,
+                    proposedTradeId: mainVirtualHunterDecision.proposedTradeId,
+                    signalId: currentSig?.id || `sig_${mainVirtualHunterTimestamp}`,
+                    strategyId: (globalSettings as any).activeStrategy || 'ADAPTIVE_DYNAMIC',
+                    strategyVersion: '2.1.0',
+                    stateRevision: deps.getAtomicStoreRevision(),
+                    // Критическое правило: для виртуального баланса и авто-обучения блокировки по просадке депозита отключены.
+                    // Торговля продолжается непрерывно до тех пор, пока автопилот не будет выключен.
+                    action: isSameDirLimitReached || isVirtualLimitReached ? 'REJECT' : 'APPROVE',
+                    confidence: 85,
+                    approved: !isSameDirLimitReached && !isVirtualLimitReached,
+                    decisionSource: 'AI',
+                    rationale: `Risk parameters within limits (Volatility: ${volatility}%, OB Imbalance: ${autoImbVal}%)`,
+                    createdAt: mainVirtualHunterTimestamp
+                };
+
+                // P0 shared intent factory call before executeMainVirtualAutoEntry
+                const mainVirtualOhlcv = GLOBAL_TRUE_OHLCV[normalizeSymbol(symbol)];
+                const mainVirtualIntentResult = createAutopilotTradeIntentFromScanner({
+                    scannerSignal: currentSig,
+                    symbol,
+                    rawSettings: globalSettings,
+                    rawMarketInput: {
+                        price: optimizedEntryPrice,
+                        high: currentSig?.high !== undefined ? Number(currentSig.high) : (mainVirtualOhlcv?.high !== undefined ? Number(mainVirtualOhlcv.high) : undefined),
+                        low: currentSig?.low !== undefined ? Number(currentSig.low) : (mainVirtualOhlcv?.low !== undefined ? Number(mainVirtualOhlcv.low) : undefined),
+                        open: currentSig?.open !== undefined ? Number(currentSig.open) : (mainVirtualOhlcv?.open !== undefined ? Number(mainVirtualOhlcv.open) : undefined),
+                        vwap: currentSig?.indicators?.vwap !== undefined ? Number(currentSig.indicators.vwap) : (currentSig?.vwap !== undefined ? Number(currentSig.vwap) : (mainVirtualOhlcv?.vwap !== undefined ? Number(mainVirtualOhlcv.vwap) : undefined)),
+                        sar: currentSig?.indicators?.sar !== undefined ? Number(currentSig.indicators.sar) : (currentSig?.sar !== undefined ? Number(currentSig.sar) : (mainVirtualOhlcv?.sar !== undefined ? Number(mainVirtualOhlcv.sar) : undefined)),
+                        rsi: currentSig?.rsi !== undefined ? Number(currentSig.rsi) : (currentSig?.indicators?.rsi1h !== undefined ? Number(currentSig.indicators.rsi1h) : (mainVirtualOhlcv?.rsi !== undefined ? Number(mainVirtualOhlcv.rsi) : undefined)),
+                        change24h: currentSig?.change24h !== undefined ? Number(currentSig.change24h) : (mainVirtualOhlcv?.change24h !== undefined ? Number(mainVirtualOhlcv.change24h) : undefined),
+                        volume24h: Number(currentSig?.volume24h) || Number(currentSig?.volume) || (mainVirtualOhlcv?.volume24h !== undefined ? Number(mainVirtualOhlcv.volume24h) : undefined),
+                        avgVolume: Number(currentSig?.volume24h) || Number(currentSig?.volume) || (mainVirtualOhlcv?.volume24h !== undefined ? Number(mainVirtualOhlcv.volume24h) : undefined),
+                        orderBookImbalance: (autoImbVal - 50) / 50
+                    },
+                    sourcePath: 'MAIN_VIRTUAL',
+                    correlationId: mainVirtualHunterDecision.correlationId,
+                    signalId: currentSig?.id || `sig_${mainVirtualHunterTimestamp}`
+                });
+
+                if (!mainVirtualIntentResult.ok) {
+                    const rej = (mainVirtualIntentResult as any).rejection;
+                    console.log(`[AUTOPILOT] [MAIN_VIRTUAL] Rejection before entry: ${rej?.reasonCode} - ${rej?.reason}`);
+                } else {
+                    const validatedIntent = mainVirtualIntentResult.intent;
+                    const executeVirtualEntryNow = async (entryPriceOverride?: number) => {
+                        const autoEntryRes = await deps.executeMainVirtualAutoEntry({
+                            symbol,
+                            tradeIntent: validatedIntent,
+                            marketInput: {
+                                symbol,
+                                marketType: validatedIntent.marketType,
+                                tradingMode: validatedIntent.requestedMode,
+                                price: entryPriceOverride ?? optimizedEntryPrice,
+                                high: validatedIntent.marketSnapshot.high,
+                                low: validatedIntent.marketSnapshot.low,
+                                open: validatedIntent.marketSnapshot.open,
+                                vwap: validatedIntent.marketSnapshot.vwap,
+                                sar: validatedIntent.marketSnapshot.sar,
+                                rsi: validatedIntent.marketSnapshot.rsi,
+                                change24h: validatedIntent.marketSnapshot.change24h,
+                                volume24h: validatedIntent.marketSnapshot.volume24h,
+                                avgVolume: validatedIntent.marketSnapshot.avgVolume,
+                                orderBookImbalance: (autoImbVal - 50) / 50,
+                                isCommitteeConsensusEnabled: (globalSettings as any).isCommitteeConsensusCheckEnabled !== false
+                            },
+                            currentSig,
+                            finalAiScore,
+                            calculatedAmount,
+                            leverage: adaptiveLeverageVirtual,
+                            stopLoss: formatNumericPrice(structuralSlVirtual.stopLoss),
+                            takeProfit: adjustedTakeProfit,
+                            tpStages: [
+                                { targetPrice: stage1Target, targetPercent: Number((tpLadderVirtual.tp4DistancePct * 0.25).toFixed(2)), closeRatio: autoRatios[0] || 0.25, executed: false },
+                                { targetPrice: stage2Target, targetPercent: Number((tpLadderVirtual.tp4DistancePct * 0.50).toFixed(2)), closeRatio: autoRatios[1] || 0.30, executed: false },
+                                { targetPrice: stage3Target, targetPercent: Number((tpLadderVirtual.tp4DistancePct * 0.75).toFixed(2)), closeRatio: autoRatios[2] || 0.25, executed: false },
+                                { targetPrice: stage4Target, targetPercent: Number(tpLadderVirtual.tp4DistancePct.toFixed(2)), closeRatio: 1.0, executed: false }
+                            ],
+                            gridOrders: (() => {
+                                if ((globalSettings as any).isDcaEnabled !== true || (globalSettings.dcaMultiplierFactor ?? 1.0) <= 0) {
+                                    return [];
+                                }
+                                const cleanSym = (symbol || '').replace(/[\/:]/g, '');
+                                const assetAtr = currentSig?.atr ? Number(currentSig.atr) : (GLOBAL_ATR[cleanSym] || (optimizedEntryPrice * 0.015));
+                                const dcaStepPct = Math.max(0.012, (assetAtr / optimizedEntryPrice) * 0.8);
+                                const p1 = validatedIntent.side === 'SHORT' ? optimizedEntryPrice * (1 + dcaStepPct) : optimizedEntryPrice * (1 - dcaStepPct);
+                                const p2 = validatedIntent.side === 'SHORT' ? optimizedEntryPrice * (1 + 2 * dcaStepPct) : optimizedEntryPrice * (1 - 2 * dcaStepPct);
+                                const dcaMultFactor = Math.min(1.0, globalSettings.dcaMultiplierFactor || 1.0);
+                                return [
+                                    { price: formatNumericPrice(p1), amount: Number((calculatedAmount * 0.20 * dcaMultFactor).toFixed(1)), executed: false },
+                                    { price: formatNumericPrice(p2), amount: Number((calculatedAmount * 0.30 * dcaMultFactor).toFixed(1)), executed: false }
+                                ];
+                            })(),
+                            targetIsAutoLearning,
+                            virtualBalance,
+                            features: currentQuantFeatures
+                        }, {
+                            executionPort: autoEntryPort,
+                            hunterDecision: mainVirtualHunterDecision,
+                            bearDecision: mainVirtualBearDecision,
+                            isCommitteeConsensusEnabled: (globalSettings as any).isCommitteeConsensusCheckEnabled !== false
+                        });
+
+                        if (autoEntryRes.executed && autoEntryRes.trade) {
+                            autoEntryRes.trade.features = currentQuantFeatures;
+                            try {
+                                const qfV2 = computeQuantFeaturesV2({
+                                    symbol,
+                                    price,
+                                    volume: Number(currentSig.volume) || 0,
+                                    trueOhlcv: GLOBAL_TRUE_OHLCV,
+                                    tickers: GLOBAL_CCXT_TICKERS,
+                                    orderBookImbalance
+                                });
+                                const quantPV2 = calculateProbabilityV2IfAccepted(qfV2.features, qfV2.hadIndicators);
+
+                                autoEntryRes.trade.entryDiagnostics = {
+                                    indicatorsSource: currentSig.decisionTrace?.metadata?.indicatorsSource ?? null,
+                                    features: currentQuantFeatures,
+                                    featuresHadIndicators: !!GLOBAL_TRUE_OHLCV[symbol],
+                                    featuresV2: qfV2.features,
+                                    featuresV2HadIndicators: qfV2.hadIndicators,
+                                    featuresV2KeyUsed: qfV2.keyUsed,
+                                    quantPV2: quantPV2 ?? null,
+                                    aiScoreRaw: currentSig.aiScore,
+                                    kbPenalty: kbEval.penaltyScore,
+                                    kbPenaltyCapped: kbEval.penaltyScoreCapped ?? kbEval.penaltyScore,
+                                    kbBonus: kbEval.bonusScore,
+                                    quantP: entryQuantP ?? null,
+                                    aiScoreFinal: finalAiScore,
+                                    marketRegime,
+                                    cellVerdict: currentCellVerdict ? {
+                                        cellKey: currentCellVerdict.cellKey,
+                                        level: currentCellVerdict.level,
+                                        n: currentCellVerdict.n,
+                                        verdict: currentCellVerdict.verdict,
+                                        adjustment: currentCellVerdict.adjustment,
+                                        wouldBlockIfFullPolicy: currentCellVerdict.wouldBlockIfFullPolicy
+                                    } : null
+                                };
+                            } catch {}
+                            if (kbEval.matchedRuleIds.length > 0) {
+                                autoEntryRes.trade.matchedRules = kbEval.matchedRuleIds;
+                                autoEntryRes.trade.matchedRuleTexts = kbEval.matchedRuleTexts;
+                                autoEntryRes.trade.matchedRuleIds = kbEval.matchedRuleIds;
+                            }
+                            deps.pushVirtualTrade(autoEntryRes.trade);
+                            if (!virtualTrades.some(t => t.id === autoEntryRes.trade.id)) {
+                                virtualTrades.push(autoEntryRes.trade);
+                            }
+                            if (deps.saveTradeDB) {
+                                try {
+                                    await deps.saveTradeDB(autoEntryRes.trade);
+                                } catch (saveErr) {
+                                    console.warn('[AUTOPILOT] Failed to save trade after entryDiagnostics:', saveErr);
+                                }
+                            }
+                            try { incFunnel('opened', 'auto_entry_virtual_success', symbol); } catch {}
+                            if (targetIsAutoLearning) {
+                                console.log(`[AUTO-LEARNING] [MAIN-THREAD] Started tracking ${validatedIntent.side === 'SHORT' ? 'SHORT' : 'LONG'} trade for ${symbol} with dynamic required score ${dynamicRequiredAutoScoreVirtual}% (WinRate: ${(autoWinRate * 100).toFixed(1)}%). CorrelationID: ${autoEntryRes.trade.id}`);
+                            } else {
+                                console.log(`[VIRTUAL AUTOPILOT] [MAIN-THREAD] Opened virtual trade for ${symbol} with dynamic required score ${dynamicRequiredAutoScoreVirtual}% (WinRate: ${(autoWinRate * 100).toFixed(1)}%). CorrelationID: ${autoEntryRes.trade.id}`);
+                            }
+                        }
+                    };
+
+                    if (globalSettings.isOteEntryEnabled === true) {
+                        const oteResult = calculateOteEntryZone({
+                            isSellSignal,
+                            price,
+                            localLow5m: cachedIndicators.localLow5m ?? price,
+                            localHigh5m: cachedIndicators.localHigh5m ?? price
+                        });
+                        if (oteResult.isValid) {
+                            try { incFunnel('ote_queued', 'ote_limit_placed_virtual', symbol); } catch {}
+                            addOtePendingCandidate({
+                                id: `ote_virtual_${symbol}_${Date.now()}`,
+                                symbol,
+                                zoneLow: oteResult.zoneLow,
+                                zoneHigh: oteResult.zoneHigh,
+                                startedAtMs: Date.now(),
+                                context: { executeVirtualEntry: executeVirtualEntryNow }
+                            });
+                        } else {
+                            await executeVirtualEntryNow();
+                        }
+                    } else {
+                        await executeVirtualEntryNow();
+                    }
+                }
+            }
+        }
+
+        // 2. REAL AUTOPILOT ENTRY
+        const config = globalSettings.exchangeApiConfig;
+        const activeRealCount = virtualTrades.filter(t => t.status === 'OPEN' && t.isReal === true && t.mode === 'AUTO').length;
+        const configuredRealMax = (globalSettings as any).maxActivePositionsReal !== undefined ? Number((globalSettings as any).maxActivePositionsReal) : 6;
+        const maxRealPositions = Math.min(6, Math.max(2, configuredRealMax || 6));
+        const isRealLimitReached = activeRealCount >= maxRealPositions;
+
+        if (globalSettings.tradingMode === 'real' && config && config.isEnabled && config.apiKey && !isDailyLimitExceeded) {
+            if (isCircuitBreakerActive) {
+                continue;
+            }
+            const isCommitteeConsensusCheckEnabled = globalSettings.isCommitteeConsensusCheckEnabled !== false;
+            const verdict = currentSig.judgeDecision || '';
+            const p = currentSig.confidenceP || 0;
+            const minThreshold = globalSettings.aiMinConfidenceThreshold !== undefined ? globalSettings.aiMinConfidenceThreshold : 0.75;
+            const isDirectionalMismatch = (isSellSignal && verdict === 'LONG') || (!isSellSignal && verdict === 'SHORT');
+            const isVetoTriggered = (verdict === 'NEUTRAL' || isDirectionalMismatch) && p >= minThreshold;
+
+            const realHunterDec: AgentDecisionEnvelope = {
+                decisionId: `dec_hunter_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                agentName: 'HUNTER',
+                signalId: currentSig.id || `sig_${Date.now()}`,
+                strategyId: 'CANONICAL_QUANT_SCALP_V2',
+                strategyVersion: '2.1.0',
+                action: 'APPROVE',
+                confidence: Math.round(finalAiScore),
+                approved: true,
+                decisionSource: 'AI',
+                rationale: `Hunter signal detected for real trade with score ${finalAiScore}`,
+                createdAt: Date.now()
+            };
+
+            const realBearDec: AgentDecisionEnvelope = {
+                decisionId: `dec_bear_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                agentName: 'BEAR',
+                signalId: currentSig.id || `sig_${Date.now()}`,
+                strategyId: 'CANONICAL_QUANT_SCALP_V2',
+                strategyVersion: '2.1.0',
+                action: isVetoTriggered ? 'REJECT' : 'APPROVE',
+                confidence: Math.round(isVetoTriggered ? (p * 100) : finalAiScore),
+                approved: !isVetoTriggered,
+                decisionSource: 'RULE_ENGINE',
+                rationale: isVetoTriggered 
+                    ? `Bear risk evaluation vetoed: verdict=${verdict}, mismatch=${isDirectionalMismatch}, p=${p}` 
+                    : `Bear risk evaluation approved for ${symbol}`,
+                createdAt: Date.now()
+            };
+
+            const realCommitteeConsensus = evaluateCommitteeConsensus(realHunterDec, realBearDec, isCommitteeConsensusCheckEnabled);
+
+            committeeVetoShadowStats.totalRealEntriesChecked++;
+            if (!realCommitteeConsensus.approved) {
+                committeeVetoShadowStats.wouldHaveBlockedCount++;
+            }
+            if (!realCommitteeConsensus.approved && isCommitteeConsensusCheckEnabled) {
+                console.log(`[COMMITTEE CONSENSUS VIOLATION] Real auto-entry for ${symbol} BLOCKED: ${realCommitteeConsensus.rationale}`);
+                continue;
+            }
+            if (!realCommitteeConsensus.approved && !isCommitteeConsensusCheckEnabled) {
+                console.log(`[COMMITTEE CONSENSUS SHADOW] Would have blocked real auto-entry for ${symbol} (${realCommitteeConsensus.rationale}) — check is currently disabled, trade proceeds.`);
+            }
+            if (config.exchange === 'weex' && !deps.isWeexApiSupported(symbol)) {
+                continue;
+            }
+            const existingRealAutoTrade = virtualTrades.find(t => {
+                const tNorm = normalizeSymbol(t.symbol);
+                return t.status === 'OPEN' && tNorm === normalizedSymbol && t.isReal === true && t.mode === 'AUTO';
+            });
+            
+            const recentlyClosedRealAuto = virtualTrades.find(t => {
+                const tNorm = normalizeSymbol(t.symbol);
+                if (tNorm === normalizedSymbol && t.status === 'CLOSED' && t.isReal === true && t.mode === 'AUTO') {
+                    const isLoss = (t.pnlPercent || 0) < 0;
+                    let cooldownTime = 10 * 60 * 1000;
+                    if (isLoss) {
+                        const agg = globalSettings.autopilotAggressiveness || 'conservative';
+                        if (agg === 'aggressive') {
+                            cooldownTime = 15 * 60 * 1000; // 15 Mins
+                        } else if (agg === 'moderate') {
+                            cooldownTime = 45 * 60 * 1000; // 45 Mins
+                        } else {
+                            cooldownTime = 2 * 60 * 60 * 1000; // 2 Hours
+                        }
+                    }
+                    return (Date.now() - (t.closeTime || 0) < cooldownTime);
+                }
+                return false;
+            });
+
+            const rsiVal = currentSig.indicators?.rsi1h ?? currentSig.rsi ?? 50;
+            const bbVal = currentSig.indicators?.bbStatus ?? currentSig.bbStatus;
+            const rawPatternNameReal = currentSig.matchedPattern || currentSig.patternName || currentSig.type || currentSig.pattern || '';
+            const blCheckReal = isPatternBlacklisted(rawPatternNameReal);
+            if (blCheckReal.blacklisted) {
+                console.log(`[AUTOPILOT REAL BLACKLIST GUARD] Skipping real entry for ${symbol}: Pattern "${rawPatternNameReal}" is blacklisted (${blCheckReal.reason})`);
+                continue;
+            }
+
+            // Rolling win rate check over the last 20 trades via SignalPerformanceAnalyticsService (< 45% threshold)
+            const rollingPerfReal = SignalPerformanceAnalyticsService.evaluatePatternRollingPerformance(virtualTrades, rawPatternNameReal, 20);
+            if (!rollingPerfReal.allowed) {
+                console.log(`[AUTOPILOT REAL ROLLING WINRATE GUARD] Skipping real entry for ${symbol}: ${rollingPerfReal.reason}`);
+                continue;
+            }
+
+            // Knowledge base validation for real entry
+            const realKbEval = evaluateKnowledgeBaseForSignal(
+                symbol,
+                {
+                    rsi: rsiVal,
+                    volumeSpike: Number(currentSig.volumeSpike) || undefined,
+                    volatility: Number(currentSig.volatility) || 2.0,
+                    change24h: Number(currentSig.change24h) || undefined
+                },
+                aiKnowledgeBase
+            );
+            if (realKbEval.isBlocked) {
+                console.log(`[AUTOPILOT REAL KNOWLEDGE GUARD] Skipping real entry for ${symbol}: ${realKbEval.blockReason}`);
+                continue;
+            }
+
+            const isVerifiedPattern = !!(currentSig.matchedPattern && (
+                currentSig.matchedPattern.includes('Spire') || 
+                currentSig.matchedPattern.includes('False Breakout') || 
+                currentSig.matchedPattern.includes('Retest') || 
+                currentSig.matchedPattern.includes('ИДЕАЛЬНЫЙ') || 
+                currentSig.matchedPattern.includes('EXTREME') || 
+                currentSig.matchedPattern.includes('Exhaustion')
+            ));
+
+            const hasLiquiditySweep = isSellSignal
+                ? (bbVal === 'OVERBOUGHT' || (currentSig.funding && currentSig.funding > 0.05) || currentSig.indicators?.topWickPct > 0.25 || currentSig.indicators?.isLiquiditySweep)
+                : (bbVal === 'OVERSOLD' || (currentSig.funding && currentSig.funding < -0.05) || currentSig.indicators?.bottomWickPct > 0.25 || currentSig.indicators?.isLiquiditySweepLow);
+            const hasConfirmedReversal = isSellSignal
+                ? (bbVal === 'OVERBOUGHT' || rsiVal > 62 || (currentSig.indicators?.topWickPct > 0.35) || isVerifiedPattern)
+                : (bbVal === 'OVERSOLD' || rsiVal < 38 || (currentSig.indicators?.bottomWickPct > 0.35) || isVerifiedPattern);
+            const isRetestPeakSignal = isVerifiedPattern || (currentSig.type && (currentSig.type.includes('РЕТЕСТ ПИКА') || currentSig.type.includes('РЕТЕСТ ДНА')));
+            
+            const cleanSymUpper = (symbol || '').split(':')[0].replace(/[\/:]/g, '').toUpperCase();
+            const activeRetestPeak = prolivPeaks.find(p => p.symbol === cleanSymUpper);
+            const retestPeakPrice = activeRetestPeak ? activeRetestPeak.peakPrice : 0;
+
+            const aggressivenessMode = globalSettings.autopilotAggressiveness || 'conservative';
+            let isEntryConf = isRetestPeakSignal || (hasLiquiditySweep && hasConfirmedReversal);
+            if (aggressivenessMode === 'moderate') {
+                isEntryConf = isRetestPeakSignal || hasLiquiditySweep || hasConfirmedReversal;
+            } else if (aggressivenessMode === 'aggressive') {
+                isEntryConf = true;
+            }
+
+            const sameDirRealCount = virtualTrades.filter(t => 
+                t.status === 'OPEN' && 
+                t.isReal === true && 
+                t.mode === 'AUTO' && 
+                t.side === (isSellSignal ? 'SHORT' : 'LONG')
+            ).length;
+            const maxSameDir = (globalSettings as any)?.maxSameDirectionPositions !== undefined
+                ? Math.min(3, Math.max(1, Number((globalSettings as any).maxSameDirectionPositions)))
+                : Math.max(1, Math.min(3, Math.ceil(maxRealPositions / 2)));
+            const isSameDirRealLimitReached = sameDirRealCount >= maxSameDir;
+
+            if (isRealLimitReached && !existingRealAutoTrade && !recentlyClosedRealAuto && isEntryConf) {
+                console.log(`[REAL AUTOPILOT] Trade for ${symbol} blocked: Max active real positions limit reached (${activeRealCount}/${maxRealPositions})`);
+            } else if (isSameDirRealLimitReached && !existingRealAutoTrade && !recentlyClosedRealAuto && isEntryConf) {
+                console.log(`[REAL AUTOPILOT] Trade for ${symbol} blocked: Max active real positions in the same direction reached (${sameDirRealCount}/${maxSameDir})`);
+            }
+
+            const isRealScoreSatisfied = finalAiScore >= dynamicRequiredAutoScoreReal;
+            const isOpeningInProgress = symbolsUndergoingRealOpen.has(normalizedSymbol);
+
+            if (isRealScoreSatisfied && !isRealLimitReached && !isSameDirRealLimitReached && !existingRealAutoTrade && !recentlyClosedRealAuto && isEntryConf && !autopilotFailedSymbols.has(symbol.toUpperCase().trim()) && !isOpeningInProgress) {
+                symbolsUndergoingRealOpen.add(normalizedSymbol);
+                (async () => {
+                    try {
+                        const exClass = (ccxt as any)[config.exchange] as typeof ccxt.Exchange;
+                        if (exClass) {
+                            let defaultOptions = { defaultType: config.exchange === 'weex' ? 'swap' : 'future' };
+                            const client = deps.getCcxtClient(config);
+                            const balance = await deps.fetchCachedRealBalance(client, defaultOptions.defaultType, false, 'fetchBalance for real autopilot').catch(() => null);
+                            let realBalanceUSDT = 100;
+                            if (balance && balance.USDT) {
+                                realBalanceUSDT = balance.USDT.total || balance.USDT.free || 100;
+                            }
+
+                            const cachedIndicatorsReal = GLOBAL_TRUE_OHLCV[normalizeSymbol(symbol)] || {};
+                            const atr = currentSig.atr ? Number(currentSig.atr) : (GLOBAL_ATR[normalizeSymbol(symbol)] || (price * 0.015));
+                            const realVolSqueezeFactor = (currentSig.atr && price > 0) ? Math.max(0.5, Math.min(1.8, (Number(currentSig.atr) / price * 100) / 1.75)) : 1.0;
+                            const dRealTp1 = Math.max(1.30, 1.60 * realVolSqueezeFactor);
+                            const dRealTp2 = Math.max(2.20, 2.70 * realVolSqueezeFactor);
+                            const dRealTp3 = Math.max(3.30, 4.00 * realVolSqueezeFactor);
+                            const dRealTp4 = Math.max(4.50, Math.min(6.50, 5.50 * realVolSqueezeFactor));
+
+                            // Реалистичная точка входа по рыночной котировке (без искусственного завышения цен входа, искажающего PnL)
+                            const optimizedEntryPriceReal = price;
+
+                            // Structural Stop-Loss (привязанный к localLow5m/localHigh5m и буферу ATR)
+                            const structuralSlReal = calculateStructuralStopLoss({
+                                isSellSignal,
+                                referencePrice: optimizedEntryPriceReal,
+                                localLow5m: cachedIndicatorsReal.localLow5m ?? price,
+                                localHigh5m: cachedIndicatorsReal.localHigh5m ?? price,
+                                atr,
+                                dAutoTp1OrDRealTp1: dRealTp1
+                            });
+                            const slDistVal = optimizedEntryPriceReal * structuralSlReal.slPct;
+                            const slPctVal = structuralSlReal.slPct;
+                            const rewardToRiskVal = 2.0;
+
+                            const k = calculateKelly(finalAiScore, rewardToRiskVal);
+                            let maxFraction = 0.05;
+                            if (aggressivenessMode === 'moderate') {
+                                maxFraction = 0.08;
+                            } else if (aggressivenessMode === 'aggressive') {
+                                maxFraction = 0.15;
+                            }
+
+                            let riskPercentage = (aggressivenessMode === 'moderate') ? 0.015 : ((aggressivenessMode === 'aggressive') ? 0.02 : 0.01);
+                            const scaledRiskPercentage = riskPercentage * Math.max(0.5, Math.min(1.5, k * 2.0));
+                            const realRiskBudget = realBalanceUSDT * scaledRiskPercentage;
+                            const targetRealPosVal = slPctVal > 0 ? (realRiskBudget / slPctVal) : (realBalanceUSDT * Math.max(0.1, k));
+                            const activeLev = Math.max(5, adaptiveLeverageReal);
+                            const targetRealMargin = targetRealPosVal / activeLev;
+
+                            const safeFraction = Math.max(0.010, Math.min(0.030, k * 0.10));
+                            const standardMargin = realBalanceUSDT * safeFraction;
+                            
+                            const openRealTradesNowCount = activeRealCount;
+                            let portfolioOverexposureMultiplier = 1.0;
+                            if (openRealTradesNowCount >= 2 && openRealTradesNowCount < 4) {
+                                portfolioOverexposureMultiplier = 0.70;
+                            } else if (openRealTradesNowCount >= 4) {
+                                portfolioOverexposureMultiplier = 0.50;
+                            }
+
+                            let challengeRiskMultiplier = 1.0;
+                            if (realBalanceUSDT <= 400.0) {
+                                challengeRiskMultiplier = 0.85;
+                            } else if (realBalanceUSDT >= 700.0 && autoWinRate >= 0.60) {
+                                challengeRiskMultiplier = 1.25;
+                            }
+
+                            const finalStreakMultiplier = streakSizeMultiplierForReal * sizeMultiplierReal;
+                            let totalMargin = Number(Math.max(20.0, Math.min(realBalanceUSDT * maxFraction, Math.min(standardMargin, targetRealMargin)) * portfolioOverexposureMultiplier * challengeRiskMultiplier * finalStreakMultiplier * (currentSig.sctoSizeMultiplier || 1.0)).toFixed(1));
+
+                            if (totalMargin < 20.0) { 
+                                if (realBalanceUSDT < 20.0) {
+                                    console.log(`[REAL AUTOPILOT] Trade for ${symbol} blocked: insufficient balance ($${realBalanceUSDT.toFixed(2)} USDT) to cover minimum margin ($20.00 USDT)`);
+                                    return;
+                                }
+                                totalMargin = 20.0; 
+                            }
+                            if (totalMargin > realBalanceUSDT * 0.9) {
+                                totalMargin = Number((realBalanceUSDT * 0.9).toFixed(1));
+                                if (totalMargin < 5.0) {
+                                    console.log(`[REAL AUTOPILOT] Trade for ${symbol} blocked: extreme margin exhaustion ($${totalMargin} USDT vs balance $${realBalanceUSDT} USDT)`);
+                                    return;
+                                }
+                            }
+                            if (totalMargin >= 20.0) {
+                                const realImbVal = orderBookImbalance[normalizeSymbol(symbol)]?.imbalance ?? 50;
+                                const step1Amount = totalMargin;
+                                const realLeverage = Math.max(5, adaptiveLeverageReal);
+                                const realRatios = calculateAdaptiveCloseRatios(realImbVal, volatility);
+
+                                // Structural TP Ladder (привязанный к swingHigh1h/swingLow1h)
+                                const tpLadderReal = calculateStructuralTpLadder({
+                                    isSellSignal,
+                                    referencePrice: price,
+                                    swingHigh1h: cachedIndicatorsReal.swingHigh1h ?? price,
+                                    swingLow1h: cachedIndicatorsReal.swingLow1h ?? price,
+                                    dAutoTp4OrDRealTp4Floor: dRealTp4
+                                });
+
+                                const rawTpPrice = tpLadderReal.stage4;
+                                const adjustedTakeProfit = deps.getWallAdjustedTp(symbol, isSellSignal, price, rawTpPrice);
+
+                                const stage1Target = tpLadderReal.stage1;
+                                const stage2Target = tpLadderReal.stage2;
+                                const stage3Target = tpLadderReal.stage3;
+                                const stage4Target = tpLadderReal.stage4;
+
+                                const realExecutionPort: AutoEntryExecutionPort = {
+                                    executeRealOpenOnExchange: async (sym, side, amt, lev) => {
+                                        if (globalSettings.isOteEntryEnabled === true) {
+                                            const oteResult = calculateOteEntryZone({
+                                                isSellSignal,
+                                                price,
+                                                localLow5m: cachedIndicatorsReal.localLow5m ?? price,
+                                                localHigh5m: cachedIndicatorsReal.localHigh5m ?? price
+                                            });
+                                            if (oteResult.isValid) {
+                                                return deps.executeRealOpenOnExchange(sym, side, amt, lev, {
+                                                    targetPrice: oteResult.targetPrice,
+                                                    timeoutMs: undefined
+                                                });
+                                            }
+                                        }
+                                        return deps.executeRealOpenOnExchange(sym, side, amt, lev);
+                                    },
+                                    setRealTradeSlTpOnExchange: async (sym, side, sl, tp) => {
+                                        return deps.setRealTradeSlTpOnExchange(sym, side, sl, tp);
+                                    },
+                                    saveTradeDB: async (t, imm) => {
+                                        await deps.saveTradeDB(t, imm);
+                                    },
+                                    saveBalanceDB: async () => {
+                                        await deps.saveBalanceDB();
+                                    },
+                                    logStructured: (level, category, message, sym, meta) => {
+                                        logStructured(level as any, category, message, sym, meta);
+                                    },
+                                    sendTelegramMessage: (text) => {
+                                        deps.sendTelegramMessage(text);
+                                    },
+                                    getAtomicStoreRevision: () => deps.getAtomicStoreRevision(),
+                                    reservePaperMargin: async (amountOrMargin: number, immutableTradeId: string, entryIntentId: string, correlationId: string, trade: any) => {
+                                        const tradeLeverage = Math.max(1, Number(trade?.leverage || 1));
+                                        const tradeNotional = Number(trade?.amount || amountOrMargin);
+                                        const margin = trade?.margin
+                                          ? Number(trade.margin)
+                                          : (amountOrMargin === tradeNotional && tradeLeverage > 1
+                                              ? Number((tradeNotional / tradeLeverage).toFixed(2))
+                                              : Number(amountOrMargin.toFixed(2)));
+
+                                        const tx = await executePaperTradeOpenTransaction(dbAtomicStore, {
+                                            tradeId: immutableTradeId,
+                                            entryIntentId,
+                                            correlationId,
+                                            margin,
+                                            trade: {
+                                                ...trade,
+                                                amount: tradeNotional,
+                                                initialAmount: tradeNotional,
+                                                margin,
+                                                initialMargin: margin,
+                                                leverage: tradeLeverage
+                                            },
+                                            initialBalanceFallback: virtualBalance
+                                        });
+                                        if (tx.success) {
+                                            virtualBalance = tx.newBalance;
+                                            deps.setVirtualBalance(tx.newBalance);
+                                            globalSettings.virtualBalance = tx.newBalance; // Authorized cache update after commit
+                                            return { success: true, newBalance: tx.newBalance };
+                                        }
+                                        return { success: false, error: tx.error || 'INSUFFICIENT_VIRTUAL_BALANCE' };
+                                    },
+                                    releasePaperMargin: async (amount: number, pnl: number, immutableTradeId: string, closeEventId: string) => {
+                                        if (!immutableTradeId || !closeEventId) {
+                                            throw new Error('IMMUTABLE_TRADE_ID_AND_CLOSE_EVENT_ID_REQUIRED');
+                                        }
+                                        const tx = await executePaperTradeCloseTransaction(dbAtomicStore, {
+                                            tradeId: immutableTradeId,
+                                            closeEventId,
+                                            closeRatio: 1.0,
+                                            pnl: pnl || 0,
+                                            isFullClose: true
+                                        });
+                                        if (tx.success) {
+                                            virtualBalance = tx.newBalance;
+                                            deps.setVirtualBalance(tx.newBalance);
+                                            globalSettings.virtualBalance = tx.newBalance; // Authorized cache update after commit
+                                            return { success: true, newBalance: tx.newBalance };
+                                        }
+                                        return { success: false, error: tx.error };
+                                    },
+                                    getAvailableVirtualBalance: () => {
+                                        const state = dbAtomicStore.loadState<any>({});
+                                        return state?.settings?.main?.virtualBalance ?? virtualBalance ?? 1000;
+                                    }
+                                };
+
+                                const mainRealHunterTimestamp = Date.now();
+                                const mainRealHunterDecision: AgentDecisionEnvelope = {
+                                    decisionId: `hunter_main_r_${mainRealHunterTimestamp}_${Math.random().toString(36).substring(2, 7)}`,
+                                    agentName: 'HUNTER',
+                                    correlationId: `corr_mr_${mainRealHunterTimestamp}_${Math.random().toString(36).substring(2, 7)}`,
+                                    proposedTradeId: `TR-REAL-${mainRealHunterTimestamp}-${Math.floor(Math.random() * 1000).toString(36).toUpperCase()}`,
+                                    signalId: currentSig?.id || `sig_${mainRealHunterTimestamp}`,
+                                    strategyId: (globalSettings as any).activeStrategy || 'ADAPTIVE_DYNAMIC',
+                                    strategyVersion: '2.1.0',
+                                    stateRevision: deps.getAtomicStoreRevision(),
+                                    action: finalAiScore >= dynamicRequiredAutoScoreReal ? 'APPROVE' : 'NO_TRADE',
+                                    confidence: finalAiScore,
+                                    approved: finalAiScore >= dynamicRequiredAutoScoreReal,
+                                    decisionSource: 'AI',
+                                    rationale: currentSig?.rationale || currentSig?.pattern || `High-conviction real signal detected (Score: ${finalAiScore}%)`,
+                                    createdAt: mainRealHunterTimestamp
+                                };
+
+                                const mainRealBearDecision: AgentDecisionEnvelope = {
+                                    decisionId: `bear_main_r_${mainRealHunterTimestamp}_${Math.random().toString(36).substring(2, 7)}`,
+                                    agentName: 'BEAR',
+                                    correlationId: mainRealHunterDecision.correlationId,
+                                    proposedTradeId: mainRealHunterDecision.proposedTradeId,
+                                    signalId: currentSig?.id || `sig_${mainRealHunterTimestamp}`,
+                                    strategyId: (globalSettings as any).activeStrategy || 'ADAPTIVE_DYNAMIC',
+                                    strategyVersion: '2.1.0',
+                                    stateRevision: deps.getAtomicStoreRevision(),
+                                    action: isDailyLimitExceeded || isSameDirRealLimitReached || isRealLimitReached || isCircuitBreakerActive ? 'REJECT' : 'APPROVE',
+                                    confidence: 90,
+                                    approved: !isDailyLimitExceeded && !isSameDirRealLimitReached && !isRealLimitReached && !isCircuitBreakerActive,
+                                    decisionSource: 'AI',
+                                    rationale: `Real risk parameters within boundaries (Volatility: ${volatility}%, OB Imbalance: ${realImbVal}%)`,
+                                    createdAt: mainRealHunterTimestamp
+                                };
+
+                                // P0 shared intent factory call before executeMainRealAutoEntry
+                                const mainRealOhlcv = GLOBAL_TRUE_OHLCV[normalizeSymbol(symbol)];
+                                const mainRealIntentResult = createAutopilotTradeIntentFromScanner({
+                                    scannerSignal: currentSig,
+                                    symbol,
+                                    rawSettings: globalSettings,
+                                    rawMarketInput: {
+                                        price: price,
+                                        high: currentSig?.high !== undefined ? Number(currentSig.high) : (mainRealOhlcv?.high !== undefined ? Number(mainRealOhlcv.high) : undefined),
+                                        low: currentSig?.low !== undefined ? Number(currentSig.low) : (mainRealOhlcv?.low !== undefined ? Number(mainRealOhlcv.low) : undefined),
+                                        open: currentSig?.open !== undefined ? Number(currentSig.open) : (mainRealOhlcv?.open !== undefined ? Number(mainRealOhlcv.open) : undefined),
+                                        vwap: currentSig?.indicators?.vwap !== undefined ? Number(currentSig.indicators.vwap) : (currentSig?.vwap !== undefined ? Number(currentSig.vwap) : (mainRealOhlcv?.vwap !== undefined ? Number(mainRealOhlcv.vwap) : undefined)),
+                                        sar: currentSig?.indicators?.sar !== undefined ? Number(currentSig.indicators.sar) : (currentSig?.sar !== undefined ? Number(currentSig.sar) : (mainRealOhlcv?.sar !== undefined ? Number(mainRealOhlcv.sar) : undefined)),
+                                        rsi: currentSig?.rsi !== undefined ? Number(currentSig.rsi) : (currentSig?.indicators?.rsi1h !== undefined ? Number(currentSig.indicators.rsi1h) : (mainRealOhlcv?.rsi !== undefined ? Number(mainRealOhlcv.rsi) : undefined)),
+                                        change24h: currentSig?.change24h !== undefined ? Number(currentSig.change24h) : (mainRealOhlcv?.change24h !== undefined ? Number(mainRealOhlcv.change24h) : undefined),
+                                        volume24h: Number(currentSig?.volume24h) || Number(currentSig?.volume) || (mainRealOhlcv?.volume24h !== undefined ? Number(mainRealOhlcv.volume24h) : undefined),
+                                        avgVolume: Number(currentSig?.volume24h) || Number(currentSig?.volume) || (mainRealOhlcv?.volume24h !== undefined ? Number(mainRealOhlcv.volume24h) : undefined),
+                                        orderBookImbalance: (realImbVal - 50) / 50
+                                    },
+                                    sourcePath: 'MAIN_REAL_STUB',
+                                    correlationId: mainRealHunterDecision.correlationId,
+                                    signalId: currentSig?.id || `sig_${mainRealHunterTimestamp}`
+                                });
+
+                                if (!mainRealIntentResult.ok) {
+                                    const rej = (mainRealIntentResult as any).rejection;
+                                    console.log(`[AUTOPILOT] [MAIN_REAL] Rejection before entry: ${rej?.reasonCode} - ${rej?.reason}`);
+                                } else {
+                                    const validatedRealIntent = mainRealIntentResult.intent;
+                                    const realAutoEntryRes = await deps.executeMainRealAutoEntry({
+                                        symbol,
+                                        tradeIntent: validatedRealIntent,
+                                        marketInput: {
+                                            symbol,
+                                            marketType: validatedRealIntent.marketType,
+                                            tradingMode: validatedRealIntent.requestedMode,
+                                            price: price,
+                                            high: validatedRealIntent.marketSnapshot.high,
+                                            low: validatedRealIntent.marketSnapshot.low,
+                                            open: validatedRealIntent.marketSnapshot.open,
+                                            vwap: validatedRealIntent.marketSnapshot.vwap,
+                                            sar: validatedRealIntent.marketSnapshot.sar,
+                                            rsi: validatedRealIntent.marketSnapshot.rsi,
+                                            change24h: validatedRealIntent.marketSnapshot.change24h,
+                                            volume24h: validatedRealIntent.marketSnapshot.volume24h,
+                                            avgVolume: validatedRealIntent.marketSnapshot.avgVolume,
+                                            orderBookImbalance: (realImbVal - 50) / 50,
+                                            isCommitteeConsensusEnabled: (globalSettings as any).isCommitteeConsensusCheckEnabled !== false
+                                        },
+                                        currentSig,
+                                        finalAiScore,
+                                        calculatedAmount: step1Amount,
+                                        leverage: realLeverage,
+                                        stopLoss: formatNumericPrice(structuralSlReal.stopLoss),
+                                        takeProfit: adjustedTakeProfit,
+                                        tpStages: [
+                                            { targetPrice: stage1Target, targetPercent: Number((tpLadderReal.tp4DistancePct * 0.25).toFixed(2)), closeRatio: realRatios[0] || 0.25, executed: false },
+                                            { targetPrice: stage2Target, targetPercent: Number((tpLadderReal.tp4DistancePct * 0.50).toFixed(2)), closeRatio: realRatios[1] || 0.30, executed: false },
+                                            { targetPrice: stage3Target, targetPercent: Number((tpLadderReal.tp4DistancePct * 0.75).toFixed(2)), closeRatio: realRatios[2] || 0.25, executed: false },
+                                            { targetPrice: stage4Target, targetPercent: Number(tpLadderReal.tp4DistancePct.toFixed(2)), closeRatio: 1.0, executed: false }
+                                        ],
+                                        gridOrders: (() => {
+                                            if ((globalSettings as any).isDcaEnabled !== true || (globalSettings.dcaMultiplierFactor ?? 1.0) <= 0) {
+                                                return [];
+                                            }
+                                            const dcaMultFactor = Math.min(1.0, globalSettings.dcaMultiplierFactor || 1.0);
+                                            return [
+                                                { price: formatNumericPrice(price + (validatedRealIntent.side === 'SHORT' ? 1 : -1) * (slDistVal * 0.5)), amount: Number((step1Amount * 0.20 * dcaMultFactor).toFixed(1)), executed: false },
+                                                { price: formatNumericPrice(price + (validatedRealIntent.side === 'SHORT' ? 1 : -1) * (slDistVal * 1.0)), amount: Number((step1Amount * 0.30 * dcaMultFactor).toFixed(1)), executed: false }
+                                            ];
+                                        })()
+                                    }, {
+                                        executionPort: realExecutionPort,
+                                        hunterDecision: mainRealHunterDecision,
+                                        bearDecision: mainRealBearDecision,
+                                        isCommitteeConsensusEnabled: (globalSettings as any).isCommitteeConsensusCheckEnabled !== false
+                                    });
+
+                                    if (realAutoEntryRes.executed && realAutoEntryRes.trade) {
+                                        realAutoEntryRes.trade.features = currentQuantFeatures;
+                                        const realRules = Array.from(new Set([...(realKbEval?.matchedRuleIds || []), ...(kbEval?.matchedRuleIds || [])]));
+                                        const realTexts = Array.from(new Set([...(realKbEval?.matchedRuleTexts || []), ...(kbEval?.matchedRuleTexts || [])]));
+                                        if (realRules.length > 0) {
+                                            realAutoEntryRes.trade.matchedRules = realRules;
+                                            realAutoEntryRes.trade.matchedRuleTexts = realTexts;
+                                            realAutoEntryRes.trade.matchedRuleIds = realRules;
+                                        }
+                                        deps.pushVirtualTrade(realAutoEntryRes.trade);
+                                        if (!virtualTrades.some(t => t.id === realAutoEntryRes.trade.id)) {
+                                            virtualTrades.push(realAutoEntryRes.trade);
+                                        }
+                                    } else if (!realAutoEntryRes.executed && realAutoEntryRes.reason) {
+                                        const failReason = realAutoEntryRes.reason;
+                                        const lowerReason = failReason.toLowerCase();
+                                        if (lowerReason.includes('1058') || lowerReason.includes('permission') || lowerReason.includes('trading pair')) {
+                                            autopilotFailedSymbols.add(symbol.toUpperCase().trim());
+                                            await deps.saveSettings();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (err: any) {
+                        console.log('[REAL AUTOPILOT POSITION OPEN FAILURE]:', err.message || err);
+                    } finally {
+                        symbolsUndergoingRealOpen.delete(normalizedSymbol);
+                    }
+                })();
+            }
+        }
+    }
+  } catch (error: any) {
+    console.error('[AUTOPILOT MAIN ENTRY ERROR]', error);
+  }
+}

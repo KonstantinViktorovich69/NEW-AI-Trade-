@@ -1,0 +1,159 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { getExchangeLink, buildExchangeSymbolsMap, getTradingAdvice, syncGlobalTickers, type TickerSyncContext } from './tickerSyncService.ts';
+
+describe('tickerSyncService', () => {
+  it('getExchangeLink generates correct exchange URLs', () => {
+    expect(getExchangeLink('okx', 'SOL/USDT')).toBe('https://www.okx.com/trade-swap/SOL-USDT-SWAP');
+    expect(getExchangeLink('weex', 'PEPE/USDT')).toBe('https://www.weex.com/trade/1000PEPE_USDT');
+    expect(getExchangeLink('weex', 'BTC/USDT')).toBe('https://www.weex.com/trade/BTC_USDT');
+    expect(getExchangeLink('bitget', 'XRP/USDT')).toBe('https://www.bitget.com/mix/usdt/XRPUSDT_UMCBL');
+  });
+
+  it('buildExchangeSymbolsMap builds correct mappings for pairs', () => {
+    const map = buildExchangeSymbolsMap(['BTC/USDT', 'ETH/USDT', 'DOGE/USDT']);
+    expect(map.kraken['BTC/USDT']).toBe('XBTUSDT');
+    expect(map.kraken['DOGE/USDT']).toBe('XDGUSDT');
+    expect(map.kucoin['ETH/USDT']).toBe('ETH-USDT');
+    expect(map.weex['BTC/USDT']).toBe('BTC_USDT');
+  });
+
+  it('getTradingAdvice returns correct advice based on signal and type', () => {
+    const shortParabola = getTradingAdvice('STRONG SELL', 'Парабола');
+    expect(shortParabola).toContain('Совет по SHORT');
+    expect(shortParabola).toContain('VWAP');
+
+    const shortStopHunt = getTradingAdvice('SELL', 'Stop Hunt');
+    expect(shortStopHunt).toContain('ложный пробой');
+
+    const longDip = getTradingAdvice('BUY', 'Пролив');
+    expect(longDip).toContain('Совет по LONG');
+    expect(longDip).toContain('Паническая распродажа');
+  });
+
+  describe('syncGlobalTickers', () => {
+    let mockContext: TickerSyncContext;
+    let isFetchingState = false;
+    let isInitialOhlcvState = false;
+    let restBlocked: Set<string>;
+    let globalCcxtTickers: Record<string, any>;
+    let wsTickers: any;
+    let apiHealth: Record<string, any>;
+
+    beforeEach(() => {
+      isFetchingState = false;
+      isInitialOhlcvState = false;
+      restBlocked = new Set<string>();
+      globalCcxtTickers = {};
+      wsTickers = { Weex: {} };
+      apiHealth = {};
+
+      const mockExchange = {
+        options: {},
+        fetchTickers: vi.fn().mockResolvedValue({
+          'BTC/USDT': {
+            symbol: 'BTC/USDT',
+            last: 65000,
+            bid: 64999,
+            ask: 65001,
+            percentage: 2.5
+          }
+        })
+      };
+
+      mockContext = {
+        getCcxtExchanges: () => ({
+          weex: mockExchange
+        }),
+        getRestBlockedExchanges: () => restBlocked,
+        getGlobalCcxtTickers: () => globalCcxtTickers,
+        getWsTickers: () => wsTickers,
+        getApiHealth: () => apiHealth,
+        safeRedisSet: vi.fn(),
+        updateSignalsCache: vi.fn(),
+        updateTrueOHLCV: vi.fn(),
+        emitPriceUpdate: vi.fn(),
+        isFetching: () => isFetchingState,
+        setIsFetching: (v) => { isFetchingState = v; },
+        isInitialOhlcvFetched: () => isInitialOhlcvState,
+        setInitialOhlcvFetched: (v) => { isInitialOhlcvState = v; },
+        fetchWeexTickersDirect: vi.fn().mockResolvedValue({
+          'BTC/USDT': {
+            symbol: 'BTC/USDT',
+            last: 50000,
+            bid: 49999,
+            ask: 50001,
+            percentage: 2.5
+          }
+        })
+      };
+    });
+
+    it('successfully syncs tickers and updates cache and signals', async () => {
+      // Temporarily bypass test mode environment var for this test
+      const originalTestMode = process.env.TEST_MODE;
+      delete process.env.TEST_MODE;
+
+      try {
+        await syncGlobalTickers(mockContext, false);
+
+        expect(mockContext.updateSignalsCache).toHaveBeenCalled();
+        expect(mockContext.emitPriceUpdate).toHaveBeenCalled();
+        expect(mockContext.updateTrueOHLCV).toHaveBeenCalled();
+        expect(isInitialOhlcvState).toBe(true);
+        expect(globalCcxtTickers.weex).toBeDefined();
+        const btcTicker = globalCcxtTickers.weex['BTC/USDT:USDT'] || globalCcxtTickers.weex['BTC/USDT'] || Object.values(globalCcxtTickers.weex)[0];
+        expect(btcTicker).toBeDefined();
+        expect(btcTicker.last).toBe(50000);
+        expect(btcTicker.symbol).toBe('BTC/USDT');
+      } finally {
+        if (originalTestMode) process.env.TEST_MODE = originalTestMode;
+      }
+    });
+
+    it('does not re-enter if isFetching is true', async () => {
+      isFetchingState = true;
+      const originalTestMode = process.env.TEST_MODE;
+      delete process.env.TEST_MODE;
+
+      try {
+        await syncGlobalTickers(mockContext, false);
+        expect(mockContext.updateSignalsCache).not.toHaveBeenCalled();
+      } finally {
+        if (originalTestMode) process.env.TEST_MODE = originalTestMode;
+      }
+    });
+
+    it('recovers seamlessly using cached tickers when WEEX REST API times out', async () => {
+      const originalTestMode = process.env.TEST_MODE;
+      delete process.env.TEST_MODE;
+
+      (globalThis as any).WEEX_CACHED_TICKERS = {
+        'ETH/USDT:USDT': {
+          symbol: 'ETH/USDT:USDT',
+          last: 3200,
+          bid: 3199,
+          ask: 3201,
+          percentage: 1.2
+        }
+      };
+
+      // Mock fetchWeexTickersDirect to reject with a timeout error
+      mockContext.fetchWeexTickersDirect = vi.fn().mockRejectedValue(new Error('timeout'));
+
+      try {
+        await syncGlobalTickers(mockContext, false);
+
+        expect(mockContext.updateSignalsCache).toHaveBeenCalled();
+        expect(mockContext.emitPriceUpdate).toHaveBeenCalled();
+        expect(globalCcxtTickers.weex).toBeDefined();
+        expect(globalCcxtTickers.weex['ETH/USDT:USDT']).toBeDefined();
+        expect(globalCcxtTickers.weex['ETH/USDT:USDT'].last).toBe(3200);
+        // WEEX should NOT be set offline
+        expect(apiHealth.weex?.status).not.toBe('offline');
+      } finally {
+        delete (globalThis as any).WEEX_CACHED_TICKERS;
+        if (originalTestMode) process.env.TEST_MODE = originalTestMode;
+      }
+    });
+  });
+});
