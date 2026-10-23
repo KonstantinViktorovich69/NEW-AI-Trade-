@@ -247,6 +247,14 @@ export function detectTradingPatterns(candles: Candle[]): PatternDetectionResult
   const highest24 = Math.max(...candles.map(c => c.high));
   const lowest24 = Math.min(...candles.map(c => c.low));
 
+  // Предыдущие свечи без текущей (для выявления истинного Swing High / Low Sweep)
+  const previousCandles = candles.slice(0, candles.length - 1);
+  const prevHigh = previousCandles.length > 0 ? Math.max(...previousCandles.map(c => c.high)) : highest24;
+  const prevLow = previousCandles.length > 0 ? Math.min(...previousCandles.map(c => c.low)) : lowest24;
+
+  const isSwingHighSweep = current.high >= prevHigh && current.close <= prevHigh;
+  const isSwingLowSweep = current.low <= prevLow && current.close >= prevLow;
+
   const totalRange = current.high - current.low;
   const upperWick = current.high - Math.max(current.open, current.close);
   const lowerWick = Math.min(current.open, current.close) - current.low;
@@ -255,18 +263,25 @@ export function detectTradingPatterns(candles: Candle[]): PatternDetectionResult
   if (totalRange > 0 && upperWick / totalRange >= 0.5 && (current.high >= highest24 * 0.995 || rsi > 70)) {
     const idealMin = current.close * 0.995;
     const idealMax = current.high;
-    const smartLimit = Number(((idealMin + idealMax) / 2).toFixed(5));
+    // Оптимальное место для лимитного ордера в шорт — верхняя треть/середина оставленной тени
+    const smartLimit = Number((current.high - (upperWick * 0.4)).toFixed(5));
+
+    const reasons = [
+      `Длинная верхняя тень (${Math.round((upperWick / totalRange) * 100)}% диапазона)`,
+      `RSI перегрет: ${rsi}`,
+      `Снятие ликвидности у максимума $${highest24.toFixed(4)}`
+    ];
+
+    if (isSwingHighSweep) {
+      reasons.push(`Подтвержденный Swing High Liquidity Sweep (прокол $${prevHigh.toFixed(4)} и возврат)`);
+    }
 
     return {
       patternName: 'Шпиль на 1м / Ложный пробой (SHORT)',
       side: 'SHORT',
-      confidence: 88,
+      confidence: isSwingHighSweep ? 92 : 88,
       dropProb: 85,
-      reasons: [
-        `Длинная верхняя тень (${Math.round((upperWick / totalRange) * 100)}% диапазона)`,
-        `RSI перегрет: ${rsi}`,
-        `Снятие ликвидности у максимума $${highest24.toFixed(4)}`
-      ],
+      reasons,
       smartLimitTarget: smartLimit,
       idealEntryMin: Number(idealMin.toFixed(5)),
       idealEntryMax: Number(idealMax.toFixed(5)),
@@ -281,18 +296,25 @@ export function detectTradingPatterns(candles: Candle[]): PatternDetectionResult
   if (totalRange > 0 && lowerWick / totalRange >= 0.5 && (current.low <= lowest24 * 1.005 || rsi < 30)) {
     const idealMin = current.low;
     const idealMax = current.close * 1.005;
-    const smartLimit = Number(((idealMin + idealMax) / 2).toFixed(5));
+    // Оптимальное место для лимитного ордера в лонг — нижняя треть/середина оставленной тени откупа
+    const smartLimit = Number((current.low + (lowerWick * 0.4)).toFixed(5));
+
+    const reasons = [
+      `Длинная нижняя тень (${Math.round((lowerWick / totalRange) * 100)}% диапазона)`,
+      `RSI перепродан: ${rsi}`,
+      `Захват ликвидности на минимуме $${lowest24.toFixed(4)}`
+    ];
+
+    if (isSwingLowSweep) {
+      reasons.push(`Подтвержденный Swing Low Liquidity Sweep (прокол $${prevLow.toFixed(4)} и откуп)`);
+    }
 
     return {
       patternName: 'Отскок от дна / Пинбар поддержки (LONG)',
       side: 'LONG',
-      confidence: 86,
+      confidence: isSwingLowSweep ? 90 : 86,
       dropProb: 15,
-      reasons: [
-        `Длинная нижняя тень (${Math.round((lowerWick / totalRange) * 100)}% диапазона)`,
-        `RSI перепродан: ${rsi}`,
-        `Захват ликвидности на минимуме $${lowest24.toFixed(4)}`
-      ],
+      reasons,
       smartLimitTarget: smartLimit,
       idealEntryMin: Number(idealMin.toFixed(5)),
       idealEntryMax: Number(idealMax.toFixed(5)),

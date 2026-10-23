@@ -75,6 +75,10 @@ export interface GlobalSettings {
   allowedSessions?: string[];
   blockedHoursUtc?: number[];
   sessionAdaptiveScoreBoost?: boolean;
+  trailingStopTriggerPnlPct?: number;
+  trailingStopDistancePct?: number;
+  minPttpPeakNetPnlPct?: number;
+  minPttpActivationNetPnlPct?: number;
 }
 
 export function createDefaultGlobalSettings(instructions = DEFAULT_BASELINE_EXPERT_INSTRUCTIONS): GlobalSettings {
@@ -98,7 +102,11 @@ export function createDefaultGlobalSettings(instructions = DEFAULT_BASELINE_EXPE
     fundingShieldLimit: -0.15,
     isDcaEnabled: false,
     dcaMultiplierFactor: 1.0,
-    timeoutStagnationHours: 8.0,
+    timeoutStagnationHours: 1.5,
+    trailingStopTriggerPnlPct: 2.8,
+    trailingStopDistancePct: 0.8,
+    minPttpPeakNetPnlPct: 3.5,
+    minPttpActivationNetPnlPct: 2.0,
     isAiPartialCloseRealEnabled: true,
     isEma200FilterEnabled: true,
     isFvgAboveFilterEnabled: true,

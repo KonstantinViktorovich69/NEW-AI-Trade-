@@ -159,8 +159,12 @@ export function evaluateStrategySignal(ctx: StrategyContext): SignalDecision {
     };
   }
 
-  // Gate 3: Liquidity Safety (Hard Gate: min volume $50,000 unless extreme move >15%)
-  const isLiquidityOk = ctx.volume24h >= 50000 || Math.abs(ctx.change24h) >= 15;
+  // Gate 3: Liquidity Safety (Строгий гейт ликвидности согласно AGENTS.md: мин. объем $50,000;
+  // монеты с меньшим объемом разрешены ТОЛЬКО при аномальном всплеске объема >= 4x и объеме >= $25,000)
+  // ЛЕГАСИ-ЛОГИКА: ранее использовалось `ctx.volume24h >= 50000 || Math.abs(ctx.change24h) >= 15`, что
+  // ошибочно допускало неликвидные монеты с широким спредом, выросшие/упавшие на 15% на пустом стакане.
+  const isVolumeSpike4x = (ctx as any).volumeSpike !== undefined && (ctx as any).volumeSpike >= 4.0;
+  const isLiquidityOk = ctx.volume24h >= 50000 || (ctx.volume24h >= 25000 && isVolumeSpike4x);
   gateDiagnostics.liquiditySafety = isLiquidityOk;
   gateDiagnostics.volumeGate = isLiquidityOk;
 

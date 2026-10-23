@@ -1,6 +1,6 @@
 {
-  "virtualBalance": 119.88,
-  "startOfDayBalance": 123.42,
+  "virtualBalance": 112.78,
+  "startOfDayBalance": 119.88,
   "telegramBots": [],
   "discordWebhooks": [],
   "exchangeApiConfig": {
@@ -13,18 +13,18 @@
   "btcShockThreshold": 1.5,
   "failedAutopilotSymbols": [],
   "modelWeights": {
-    "beta0": -0.9044309221250842,
-    "beta1": 0.27534153282748086,
-    "beta2": -0.08285769088668027,
-    "beta3": 0.5421418077375191,
-    "beta4": 0.576001136726296,
-    "beta5": 0.18578394883136146,
-    "beta6": -0.3162778613001646,
-    "beta7": -0.13833991079801727,
-    "beta8": 0.593126209611271,
-    "beta9": 0.5288927017393289,
-    "beta10": 0.9977235928973808,
-    "beta11": 1.282193961035544
+    "beta0": -0.8404150333478517,
+    "beta1": 1.0863943952098714,
+    "beta2": -0.068511646022476,
+    "beta3": 0.8559097607812055,
+    "beta4": 0.3268363079111036,
+    "beta5": -0.18960532744913225,
+    "beta6": 0.40640484231878005,
+    "beta7": -0.14365674353405827,
+    "beta8": 0.8612615047600727,
+    "beta9": 1.3778184893060519,
+    "beta10": 0.5880616939304875,
+    "beta11": 1.0081386900019522
   },
   "autopilotAggressiveness": "conservative",
   "isAiExpertTraderEnabled": true,
@@ -38,6 +38,10 @@
   "isDcaEnabled": false,
   "dcaMultiplierFactor": 1,
   "timeoutStagnationHours": 8,
+  "trailingStopTriggerPnlPct": 2.8,
+  "trailingStopDistancePct": 0.8,
+  "minPttpPeakNetPnlPct": 3.5,
+  "minPttpActivationNetPnlPct": 2,
   "isAiPartialCloseRealEnabled": true,
   "isEma200FilterEnabled": true,
   "isFvgAboveFilterEnabled": true,
@@ -70,9 +74,9 @@
   "virtualEquity": 119.88,
   "uiStatsResetTimestamp": 1791122286530,
   "modelStatusMetadata": {
-    "totalLearnedTrades": 372,
-    "lastRetrained": 1792322836394
+    "totalLearnedTrades": 228,
+    "lastRetrained": 1792743976034
   },
-  "stateRevision": 6,
-  "updatedAt": 1792322870247
+  "stateRevision": 14,
+  "updatedAt": 1792743976034
 }

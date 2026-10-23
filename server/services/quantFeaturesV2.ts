@@ -4,6 +4,7 @@ export interface ComputeQuantFeaturesV2Params {
   symbol: string;
   price: number;
   volume: number;
+  side?: 'LONG' | 'SHORT';
   trueOhlcv?: Record<string, any>;
   tickers?: Record<string, any>;
   orderBookImbalance?: Record<string, any>;
@@ -20,14 +21,13 @@ export interface ComputeQuantFeaturesV2Result {
  * Computes 11 quant features for Quant Model v2 using clean input data.
  * Pure function: takes direct arguments rather than global contexts.
  *
- * Fixes compared to v1 calculateConfidenceProbability:
- * 1. Indicator lookup checks candidate keys [symbol, cleanSymbol(symbol), normalizeSymbol(symbol)] in trueOhlcv.
- * 2. x6 (hourly volume spike) is calculated using WEEX ticker via findTickerInMap with quoteVolume/24.
- * 3. orderBookImbalance is looked up across candidate keys.
- * 4. If no indicators found, hadIndicators = false and all 11 features are set to 0.
+ * Directional Symmetry Enhancement:
+ * Supports side: 'LONG' | 'SHORT'. When side is 'LONG', features (RSI distance,
+ * wicks, VWAP displacement, SAR) are symmetrically evaluated for oversold/bounce setups.
+ * When side is 'SHORT' or undefined, maintains 100% backward-compatible legacy behavior.
  */
 export function computeQuantFeaturesV2(params: ComputeQuantFeaturesV2Params): ComputeQuantFeaturesV2Result {
-  const { symbol, price, volume, trueOhlcv, tickers, orderBookImbalance } = params;
+  const { symbol, price, volume, side, trueOhlcv, tickers, orderBookImbalance } = params;
 
   if (!symbol) {
     return { features: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], hadIndicators: false };
@@ -70,21 +70,26 @@ export function computeQuantFeaturesV2(params: ComputeQuantFeaturesV2Params): Co
   }
 
   const currentPrice = price > 0 ? price : (indicators.close || indicators.price || 1);
+  const isLong = side === 'LONG';
 
-  // x1: 48h breakout
-  const x1 = indicators.is48hBreakout || 0;
+  // x1: 48h breakout / breakdown
+  const x1 = isLong ? (indicators.is48hBreakdown || indicators.is48hBreakout || 0) : (indicators.is48hBreakout || 0);
 
-  // x2: 1h RSI centered at 0: (rsi - 50)
-  const x2 = (indicators.rsi1h !== undefined ? indicators.rsi1h : (indicators.rsi !== undefined ? indicators.rsi : 50)) - 50;
+  // x2: 1h RSI centered at 0: for SHORT: (rsi - 50); for LONG: (50 - rsi)
+  const rawRsi = (indicators.rsi1h !== undefined ? indicators.rsi1h : (indicators.rsi !== undefined ? indicators.rsi : 50));
+  const x2 = isLong ? (50 - rawRsi) : (rawRsi - 50);
 
   // x3: MACD histogram relative to price (%)
-  const x3 = ((indicators.macdHistogram || 0) / (currentPrice || 1)) * 100;
+  const rawMacd = ((indicators.macdHistogram || 0) / (currentPrice || 1)) * 100;
+  const x3 = isLong ? -rawMacd : rawMacd;
 
   // x4: Distance from EMA50 (%)
-  const x4 = indicators.ema50 ? ((currentPrice - indicators.ema50) / indicators.ema50) * 100 : 0;
+  const rawEma50Dist = indicators.ema50 ? ((currentPrice - indicators.ema50) / indicators.ema50) * 100 : 0;
+  const x4 = isLong ? -rawEma50Dist : rawEma50Dist;
 
   // x5: Distance from EMA200 (%)
-  const x5 = indicators.ema200 ? ((currentPrice - indicators.ema200) / indicators.ema200) * 100 : 0;
+  const rawEma200Dist = indicators.ema200 ? ((currentPrice - indicators.ema200) / indicators.ema200) * 100 : 0;
+  const x5 = isLong ? -rawEma200Dist : rawEma200Dist;
 
   // x6: Volume spike from real OHLCV candles (volumeSpike >= 1.5 ? 1 : 0)
   const x6 = (indicators.volumeSpike !== undefined && indicators.volumeSpike >= 1.5) ? 1 : 0;
@@ -99,19 +104,27 @@ export function computeQuantFeaturesV2(params: ComputeQuantFeaturesV2Params): Co
       }
     }
   }
-  const x7 = (ob?.imbalance !== undefined ? ob.imbalance : 0) / 100;
+  const rawImbalance = (ob?.imbalance !== undefined ? ob.imbalance : 0) / 100;
+  const x7 = isLong ? -rawImbalance : rawImbalance;
 
-  // x8: Top wick percentage
-  const x8 = indicators.wicks?.topPct || 0;
+  // x8: Wick percentage: for SHORT: top wick (rejection above); for LONG: bottom wick (rejection below)
+  const x8 = isLong
+    ? (indicators.wicks?.bottomPct ?? indicators.wicks?.lowerPct ?? indicators.wicks?.tailPct ?? indicators.wicks?.topPct ?? 0)
+    : (indicators.wicks?.topPct || 0);
 
   // x9: Liquidity sweep flag
-  const x9 = (indicators.isLiquiditySweep || indicators.isLiquiditySweep1h || indicators.isLiquiditySweep5m) ? 1 : 0;
+  const x9 = isLong
+    ? (indicators.isLiquiditySweepLow || indicators.isLiquiditySweepLow1h || indicators.isLiquiditySweep || indicators.isLiquiditySweep1h || indicators.isLiquiditySweep5m ? 1 : 0)
+    : (indicators.isLiquiditySweep || indicators.isLiquiditySweep1h || indicators.isLiquiditySweep5m ? 1 : 0);
 
-  // x10: Distance from VWAP (%)
-  const x10 = indicators.vwap ? ((currentPrice - indicators.vwap) / indicators.vwap) * 100 : 0;
+  // x10: Distance from VWAP (%): for SHORT: (price - vwap); for LONG: (vwap - price)
+  const rawVwapDist = indicators.vwap ? ((currentPrice - indicators.vwap) / indicators.vwap) * 100 : 0;
+  const x10 = isLong ? -rawVwapDist : rawVwapDist;
 
-  // x11: Parabolic SAR status: BEARISH -> 1, BULLISH -> -1
-  const x11 = indicators.psarStatus === 'BEARISH' ? 1 : (indicators.psarStatus === 'BULLISH' ? -1 : 0);
+  // x11: Parabolic SAR status: for SHORT: BEARISH -> 1, BULLISH -> -1; for LONG: BULLISH -> 1, BEARISH -> -1
+  const x11 = isLong
+    ? (indicators.psarStatus === 'BULLISH' ? 1 : (indicators.psarStatus === 'BEARISH' ? -1 : 0))
+    : (indicators.psarStatus === 'BEARISH' ? 1 : (indicators.psarStatus === 'BULLISH' ? -1 : 0));
 
   const features = [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11];
 

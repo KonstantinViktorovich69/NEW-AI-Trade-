@@ -9,6 +9,7 @@ const TradingChart = lazy(() => import('./TradingChart').then(m => ({ default: m
 const AnalyticsTab = lazy(() => import('./AnalyticsTab').then(m => ({ default: m.default || m.AnalyticsTab })));
 const SignalAnalyticsDashboard = lazy(() => import('./SignalAnalyticsDashboard').then(m => ({ default: m.default || m.SignalAnalyticsDashboard })));
 const FundingArbitragePanel = lazy(() => import('./FundingArbitragePanel').then(m => ({ default: m.default || m.FundingArbitragePanel })));
+const BacktestPanel = lazy(() => import('./BacktestPanel').then(m => ({ default: m.default || m.BacktestPanel })));
 
 function Tooltip({ text, children, className }: { text: string, children: React.ReactNode, position?: 'top' | 'right' | 'bottom', className?: string, key?: string | number }) {
   return (
@@ -2224,7 +2225,7 @@ export function TradingTerminal({
     };
   }, [reconnectTrigger]);
 
-  const [mainTab, setMainTab] = useState<'scanner' | 'funding' | 'knowledge' | 'history' | 'peaks' | 'telemetry' | 'signal_analytics'>('scanner');
+  const [mainTab, setMainTab] = useState<'scanner' | 'funding' | 'knowledge' | 'history' | 'peaks' | 'telemetry' | 'signal_analytics' | 'backtest'>('scanner');
   
   useEffect(() => {
     if (isStandaloneTerminal || isStandaloneTrade) {
@@ -4952,6 +4953,18 @@ export function TradingTerminal({
             >
               <Calculator className="w-3.5 h-3.5 text-emerald-400 shrink-0" /> ФАНДИНГ
             </button>
+
+            <button 
+              onClick={() => setMainTab('backtest')} 
+              className={cn(
+                "px-2.5 py-1.5 rounded-xl font-bold text-[10px] uppercase tracking-wider transition-all duration-300 whitespace-nowrap flex items-center gap-1.5", 
+                mainTab === 'backtest' 
+                  ? "bg-purple-500/20 text-purple-300 border border-purple-500/30 shadow-glow-indigo" 
+                  : "text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.02]"
+              )}
+            >
+              <BarChart3 className="w-3.5 h-3.5 text-purple-400 shrink-0" /> БЭКТЕСТ & WFO
+            </button>
           </div>
 
         <div className="flex items-center gap-3 px-3 border-l border-white/[0.06] ml-2 shrink-0">
@@ -5035,6 +5048,17 @@ export function TradingTerminal({
           </div>
         }>
           <FundingArbitragePanel addToast={addToast} />
+        </Suspense>
+      )}
+
+      {mainTab === 'backtest' && (
+        <Suspense fallback={
+          <div className="flex flex-col items-center justify-center py-20 bg-zinc-900/50 border border-zinc-800/50 rounded-xl text-zinc-500">
+            <Loader2 className="w-6 h-6 text-purple-500 animate-spin mb-2" />
+            <span className="text-xs text-zinc-400 font-mono">Загрузка модуля бэктестинга и WFO...</span>
+          </div>
+        }>
+          <BacktestPanel addToast={addToast} />
         </Suspense>
       )}
 

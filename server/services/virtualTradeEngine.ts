@@ -55,25 +55,34 @@ let lastWeekCheckTime = 0;
 let lastRealDrawdownCheckTime = 0;
 
 export function buildExitPolicyConfig(globalSettings: any, trade: any): ExitPolicySettings {
+  // ЧИСТО АДДИТИВНАЯ КАЛИБРОВКА: если параметры явно переопределены в globalSettings,
+  // используем их; если globalSettings пуст ({}), сохраняем строгие легаси-дефолты для обратной совместимости тестов.
+  const hasCustomTrailing = typeof (globalSettings as any)?.trailingStopTriggerPnlPct === 'number';
+  const hasCustomPttp = typeof (globalSettings as any)?.minPttpPeakNetPnlPct === 'number';
+  const hasCustomPttpAct = typeof (globalSettings as any)?.minPttpActivationNetPnlPct === 'number';
+  const hasCustomAutoClose = typeof (globalSettings as any)?.minNormalAutoCloseNetPnlPct === 'number';
+
   return {
-    minNormalAutoCloseNetPnlPct: 6.0,
-    minPttpActivationNetPnlPct: 12.0,
-    minPttpPeakNetPnlPct: 18.0,
-    pttpTrailingDropPct: 35.0,
-    maxLifetimeHours: (globalSettings as any).maxLifetimeHours ?? 24,
-    allowEmergencyMaxLifetime: (globalSettings as any).allowEmergencyMaxLifetime ?? true,
-    timeoutProfitHours: 18,
-    minTimeoutProfitNetPnlPct: 6.0,
+    minNormalAutoCloseNetPnlPct: hasCustomAutoClose ? (globalSettings as any).minNormalAutoCloseNetPnlPct : 6.0,
+    minPttpActivationNetPnlPct: hasCustomPttpAct ? (globalSettings as any).minPttpActivationNetPnlPct : 12.0,
+    minPttpPeakNetPnlPct: hasCustomPttp ? (globalSettings as any).minPttpPeakNetPnlPct : 18.0,
+    pttpTrailingDropPct: (globalSettings as any)?.pttpTrailingDropPct ?? 35.0,
+    maxLifetimeHours: (globalSettings as any)?.maxLifetimeHours ?? 24,
+    allowEmergencyMaxLifetime: (globalSettings as any)?.allowEmergencyMaxLifetime ?? true,
+    timeoutProfitHours: (globalSettings as any)?.timeoutProfitHours ?? 18,
+    minTimeoutProfitNetPnlPct: (globalSettings as any)?.minTimeoutProfitNetPnlPct ?? 6.0,
     enableStagnationTimeout: true,
-    timeoutStagnationHours: (globalSettings as any).timeoutStagnationHours ?? 8.0,
-    maxStagnationPnlPct: 0.5,
+    timeoutStagnationHours: (globalSettings as any)?.timeoutStagnationHours ?? 8.0,
+    maxStagnationPnlPct: (globalSettings as any)?.maxStagnationPnlPct ?? 0.5,
     enableMultiTp: trade.isMultiTp !== false,
     multiTpTargets: trade.tpStages,
     bypassProfitFloorForMultiTp: true,
     bypassProfitFloorForPrimaryTp: true,
     enableTrailingStop: true,
-    trailingStopTriggerPnlPct: 14.0,
-    trailingStopDistancePct: 3.0
+    trailingStopTriggerPnlPct: hasCustomTrailing ? (globalSettings as any).trailingStopTriggerPnlPct : 14.0,
+    trailingStopDistancePct: typeof (globalSettings as any)?.trailingStopDistancePct === 'number'
+      ? (globalSettings as any).trailingStopDistancePct
+      : 3.0
   };
 }
 

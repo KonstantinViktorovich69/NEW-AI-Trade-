@@ -991,6 +991,7 @@ export async function runAutopilotAndVirtualTradeEntry(deps: AutoPilotEngineDepe
                                     symbol,
                                     price,
                                     volume: Number(currentSig.volume) || 0,
+                                    side: (currentSig.type === 'LONG' || currentSig.side === 'LONG') ? 'LONG' : 'SHORT',
                                     trueOhlcv: GLOBAL_TRUE_OHLCV,
                                     tickers: GLOBAL_CCXT_TICKERS,
                                     orderBookImbalance

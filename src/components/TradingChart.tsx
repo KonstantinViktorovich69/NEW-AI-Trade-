@@ -253,8 +253,12 @@ export const TradingChart = memo(function TradingChart({
       lastValueVisible: false,
     });
 
-    const markersPlugin = createSeriesMarkers(candlestickSeries, []);
-    candlestickSeries.attachPrimitive(markersPlugin as any);
+    let markersPlugin: any = null;
+    try {
+      markersPlugin = createSeriesMarkers(candlestickSeries, []);
+    } catch (err) {
+      console.warn('[CHART] createSeriesMarkers initialization note:', err);
+    }
 
     chartRef.current = { chart, candlestickSeries, volumeSeries, vwapSeries, smaSeries, sarSeries, markersPlugin };
 
